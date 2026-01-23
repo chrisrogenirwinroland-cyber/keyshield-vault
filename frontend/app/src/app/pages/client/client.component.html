@@ -1,0 +1,31 @@
+<div class="wrap">
+  <h1>KeyShield Vault — Client</h1>
+
+  <div class="nav">
+    <a routerLink="/admin">Admin</a> |
+    <a routerLink="/client">Client</a>
+  </div>
+
+  <div class="card">
+    <h2>Access Protected Asset</h2>
+
+    <div class="row">
+      <label>API Key</label>
+      <input [(ngModel)]="apiKey" placeholder="Paste raw key once from Admin page" />
+    </div>
+
+    <button type="button" (click)="accessAsset()" [disabled]="loading || !apiKey">
+      Access Asset
+    </button>
+
+    <p class="ok" *ngIf="accessMsg">{{ accessMsg }}</p>
+
+    <div class="ok" *ngIf="rotatedKey">
+      <p><strong>Rotated key (one-time):</strong></p>
+      <code class="codeblock">{{ rotatedKey }}</code>
+      <p class="hint">This rotated key is auto-filled into the input for the next access attempt.</p>
+    </div>
+
+    <p class="err" *ngIf="error">{{ error }}</p>
+  </div>
+</div>
