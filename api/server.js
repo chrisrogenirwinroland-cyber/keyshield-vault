@@ -1,8 +1,3 @@
-/**
- * KeyShield Vault API - server.js
- * Express v5: DO NOT use app.options("*", ...)
- * Use regex for preflight catch-all.
- */
 const express = require("express");
 const cors = require("cors");
 
@@ -13,17 +8,17 @@ const metricsRoutes = require("./routes/metrics");
 
 const app = express();
 
+// CORS for Angular dev server (4200)
 const corsOptions = {
   origin: "http://localhost:4200",
   methods: ["GET", "POST", "DELETE", "PUT", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "x-api-key"],
-  credentials: false,
 };
 
-// CORS for all routes
 app.use(cors(corsOptions));
 
-// Preflight for ALL paths (Express v5 safe)
+// Express v5: DO NOT use app.options("*", ...)
+// Use regex to match all routes for preflight
 app.options(/.*/, cors(corsOptions));
 
 app.use(express.json());
