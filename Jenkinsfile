@@ -1,3 +1,18 @@
+// Jenkinsfile — KeyShield Vault (Windows Jenkins agent + Docker)
+// Repo layout assumed:
+//   /api
+//   /frontend/app
+//
+// REQUIRED Jenkins Credentials:
+//   1) SONAR_TOKEN   (Secret text)  -> SonarCloud project token
+// OPTIONAL Jenkins Credentials (only if you enable push/deploy):
+//   2) DOCKERHUB_CREDS (Username/Password) OR other registry creds
+//
+// IMPORTANT (SonarCloud):
+// - If you see: "manual analysis while Automatic Analysis is enabled"
+//   In SonarCloud Project -> Administration -> Analysis Method
+//   Disable "Automatic Analysis" (keep CI analysis via Jenkins as your automated evidence).
+
 pipeline {
   agent any
 
