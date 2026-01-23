@@ -205,14 +205,13 @@ pipeline {
       when { expression { return params.DEPLOY_STAGING } }
       steps {
         script {
-          // Customize this to your environment (docker compose, kubectl, etc.)
-          // Option A rule: deployment should not break your build if it's only a demo run.
+          .
           try {
             echo 'Deploying to staging (placeholder)...'
             // Example (if you add docker-compose.yml later):
             // bat 'docker compose up -d --build'
           } catch (e) {
-            echo 'Deploy failed/skipped but build remains SUCCESS (Option A).'
+            echo 'Deploy failed/skipped but build remains SUCCESS.'
           }
         }
       }
