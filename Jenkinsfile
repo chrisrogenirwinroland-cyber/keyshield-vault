@@ -208,7 +208,7 @@ pipeline {
           .
           try {
             echo 'Deploying to staging (placeholder)...'
-            // Example (if you add docker-compose.yml later):
+            // Example (if you add docker-compose.yml later)
             // bat 'docker compose up -d --build'
           } catch (e) {
             echo 'Deploy failed/skipped but build remains SUCCESS.'
