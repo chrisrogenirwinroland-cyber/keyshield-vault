@@ -1,29 +1,31 @@
-
 pipeline {
   agent any
 
   options {
     timestamps()
-    skipDefaultCheckout(true)
     disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '10'))
   }
 
   environment {
-    // Set these in Jenkins (Manage Jenkins → Credentials / Global env or pipeline env injection)
-    // DO NOT hardcode secrets here.
+    // ---- SonarCloud ----
+    SONAR_HOST_URL = 'https://sonarcloud.io'
+    // Set these to YOUR values (must match your SonarCloud project)
+    SONAR_ORG      = 'chrisrogenirwinroland-cyber'
+    SONAR_PROJECT  = 'chrisrogenirwinroland-cyber_keyshield-vault'
 
-    // SonarCloud:
-    // IMPORTANT: Rubric says "Automatic Analysis" → we do NOT run sonar-scanner in Jenkins.
-    // So we keep only a link/echo stage (optional).
-    SONARCLOUD_DASHBOARD = "https://sonarcloud.io/dashboard?id=chrisrogenirwinroland-cyber_keyshield-vault"
+    // SONAR_TOKEN should be stored in Jenkins Credentials as "Secret text"
+    // Credential ID below must match Jenkins -> Manage Credentials
+    // Example ID: sonarcloud-token
+    // DO NOT hardcode the token in this file.
 
-    // Docker registry (optional)
-    DOCKER_IMAGE_API      = "chrisrogenirwinroland/keyshield-vault-api"
+    // ---- Trivy ----
+    TRIVY_TIMEOUT  = '20m'
+
+    // ---- Docker (optional / guarded) ----
+    DOCKER_TAG = "${env.BUILD_NUMBER}"
+    DOCKER_IMAGE_API = "chrisrogenirwinroland/keyshield-vault-api"
     DOCKER_IMAGE_FRONTEND = "chrisrogenirwinroland/keyshield-vault-frontend"
-    DOCKER_TAG            = "${env.BUILD_NUMBER}"
-
-    // Trivy
-    TRIVY_TIMEOUT = "15m"
   }
 
   stages {
@@ -36,12 +38,12 @@ pipeline {
 
     stage('Build') {
       steps {
-        // API
+        echo "Installing & building API"
         dir('api') {
           bat 'npm ci'
         }
 
-        // Frontend
+        echo "Installing & building Frontend"
         dir('frontend\\app') {
           bat 'npm ci'
           bat 'npm run build'
@@ -51,98 +53,131 @@ pipeline {
 
     stage('Test') {
       steps {
+        echo "Running API tests"
         dir('api') {
           bat 'npm test'
         }
-        // If you add frontend tests later, put them here.
       }
     }
 
-    stage('Code Quality (SonarCloud - Automatic Analysis)') {
+    stage('Code Quality (SonarCloud)') {
       steps {
-        echo "Rubric: SonarCloud Automatic Analysis enabled. Skipping manual sonar-scanner in Jenkins."
-        echo "Check results at: ${SONARCLOUD_DASHBOARD}"
+        withCredentials([string(credentialsId: 'sonarcloud-token', variable: 'SONAR_TOKEN')]) {
+          // Run scanner inside Linux (WSL2) sonar-scanner as your logs show.
+          // This avoids PowerShell argument parsing issues.
+          powershell '''
+            $ErrorActionPreference = "Stop"
+
+            docker run --rm ^
+              -e SONAR_TOKEN=$env:SONAR_TOKEN ^
+              -v "${env:WORKSPACE}:/usr/src" ^
+              sonarsource/sonar-scanner-cli:latest ^
+              -Dsonar.organization=${env:SONAR_ORG} ^
+              -Dsonar.projectKey=${env:SONAR_PROJECT} ^
+              -Dsonar.host.url=${env:SONAR_HOST_URL} ^
+              -Dsonar.sources=. ^
+              -Dsonar.exclusions=**/node_modules/**,**/coverage/**,**/dist/**,**/out/**,**/build/** ^
+              -Dsonar.sourceEncoding=UTF-8
+          '''
+        }
       }
     }
 
     stage('Security (npm audit + Trivy)') {
       steps {
-        // npm audit (don’t fail build on findings for rubric demo; adjust if needed)
+        echo "npm audit (API) - do not fail build"
         dir('api') {
           bat 'npm audit --audit-level=high || exit /b 0'
         }
+
+        echo "npm audit (Frontend) - do not fail build"
         dir('frontend\\app') {
           bat 'npm audit --audit-level=high || exit /b 0'
         }
 
-        // Trivy filesystem scan (avoid secret scanning + extend timeout to prevent deadline exceeded)
-        // Uses public image aquasec/trivy:latest (no docker login needed).
-        bat """
+        echo "Trivy FS scan - increase timeout, reduce slow secret scan risk"
+        powershell '''
+          $ErrorActionPreference = "Stop"
+
+          # Pull once (cached after first run)
+          docker pull aquasec/trivy:latest | Out-Null
+
+          # Run filesystem scan on workspace.
+          # - Increase timeout to avoid context deadline exceeded
+          # - Disable secret scan to prevent long-running hangs on Jenkinsfile
+          # - Keep vuln + misconfig scanning for rubric/security evidence
           docker run --rm ^
-            -v "%CD%":/work ^
+            -v "${env:WORKSPACE}:/work" ^
             aquasec/trivy:latest fs /work ^
+            --timeout ${env:TRIVY_TIMEOUT} ^
             --scanners vuln,misconfig ^
-            --timeout ${TRIVY_TIMEOUT} ^
-            --skip-dirs /work/node_modules,/work/api/node_modules,/work/frontend/app/node_modules,/work/frontend/app/dist ^
-            --severity HIGH,CRITICAL ^
+            --skip-dirs /work/**/node_modules ^
+            --skip-dirs /work/**/dist ^
+            --skip-dirs /work/**/coverage ^
             --exit-code 0
-        """
+        '''
       }
     }
 
+    // -----------------------------
+    // OPTIONAL DOCKER ARTEFACTS (GUARDED)
+    // -----------------------------
     stage('Build Artefact (Docker Images)') {
+      when {
+        expression {
+          return fileExists('api/Dockerfile') || fileExists('frontend/app/Dockerfile') || fileExists('frontend\\app\\Dockerfile')
+        }
+      }
       steps {
-        // If you do not need Docker images for marking, you can comment this stage out.
-        // Otherwise ensure Docker daemon is available on the Jenkins agent.
-        bat """
-          docker build -t %DOCKER_IMAGE_API%:%DOCKER_TAG% -f api\\Dockerfile api
-          docker build -t %DOCKER_IMAGE_FRONTEND%:%DOCKER_TAG% -f frontend\\app\\Dockerfile frontend\\app
-        """
+        script {
+          if (fileExists('api/Dockerfile')) {
+            bat 'docker build -t %DOCKER_IMAGE_API%:%DOCKER_TAG% -f api\\Dockerfile api'
+          } else {
+            echo 'Skipping API docker build (api/Dockerfile not found).'
+          }
+
+          // support both path styles
+          if (fileExists('frontend/app/Dockerfile')) {
+            bat 'docker build -t %DOCKER_IMAGE_FRONTEND%:%DOCKER_TAG% -f frontend\\app\\Dockerfile frontend\\app'
+          } else if (fileExists('frontend\\app\\Dockerfile')) {
+            bat 'docker build -t %DOCKER_IMAGE_FRONTEND%:%DOCKER_TAG% -f frontend\\app\\Dockerfile frontend\\app'
+          } else {
+            echo 'Skipping Frontend docker build (frontend/app/Dockerfile not found).'
+          }
+        }
       }
     }
 
     stage('Push Artefact (Optional)') {
       when {
-        expression { return env.DOCKERHUB_USER != null && env.DOCKERHUB_PASS != null }
+        expression {
+          return (fileExists('api/Dockerfile') || fileExists('frontend/app/Dockerfile') || fileExists('frontend\\app\\Dockerfile'))
+        }
       }
       steps {
-        // Set DOCKERHUB_USER and DOCKERHUB_PASS as Jenkins credentials (Username/Password)
-        // IMPORTANT: Your Docker Hub email must be verified or login may fail.
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKERHUB_USER', passwordVariable: 'DOCKERHUB_PASS')]) {
-          bat """
-            echo %DOCKERHUB_PASS% | docker login -u %DOCKERHUB_USER% --password-stdin
-            docker push %DOCKER_IMAGE_API%:%DOCKER_TAG%
-            docker push %DOCKER_IMAGE_FRONTEND%:%DOCKER_TAG%
-          """
-        }
+        echo "Push skipped (optional). Configure DockerHub creds if you need this."
+        // If you MUST push later, add:
+        // withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+        //   bat 'echo %DH_PASS% | docker login -u %DH_USER% --password-stdin'
+        //   bat 'docker push %DOCKER_IMAGE_API%:%DOCKER_TAG%'
+        //   bat 'docker push %DOCKER_IMAGE_FRONTEND%:%DOCKER_TAG%'
+        // }
       }
     }
 
     stage('Deploy (Staging) - Optional') {
-      when {
-        expression { return false } // flip to true only if you actually have a staging target
-      }
-      steps {
-        echo "Deploy stage placeholder (staging)."
-      }
+      when { expression { return false } }
+      steps { echo "Deploy disabled for rubric demo." }
     }
 
     stage('Release (Promote to Prod) - Optional') {
-      when {
-        expression { return false } // flip to true only if you actually do promotion
-      }
-      steps {
-        echo "Release stage placeholder (promotion)."
-      }
+      when { expression { return false } }
+      steps { echo "Release disabled for rubric demo." }
     }
 
     stage('Monitoring (Health + Metrics) - Optional') {
-      when {
-        expression { return false }
-      }
-      steps {
-        echo "Monitoring stage placeholder."
-      }
+      when { expression { return false } }
+      steps { echo "Monitoring disabled for rubric demo." }
     }
   }
 
@@ -150,11 +185,13 @@ pipeline {
     always {
       echo "Pipeline completed."
       echo "Workspace: ${env.WORKSPACE}"
-      // show containers (helps for evidence)
       bat 'docker ps || exit /b 0'
     }
+    success {
+      echo "SUCCESS: Build/Test/Quality/Security completed."
+    }
     failure {
-      echo "Pipeline failed. Check the failing stage logs above."
+      echo "FAILURE: Check the failing stage logs above."
     }
   }
 }
