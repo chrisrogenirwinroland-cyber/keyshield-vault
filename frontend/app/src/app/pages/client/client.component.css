@@ -1,0 +1,11 @@
+.wrap { max-width: 900px; margin: 24px auto; font-family: Arial, sans-serif; }
+.nav { margin: 8px 0 16px; }
+.card { border: 1px solid #333; border-radius: 10px; padding: 16px; margin: 12px 0; }
+.row { display: flex; gap: 12px; margin: 8px 0; align-items: center; }
+label { width: 90px; }
+input { flex: 1; padding: 8px; }
+button { margin-right: 8px; padding: 8px 12px; }
+.err { color: #ff6b6b; white-space: pre-wrap; }
+.ok { margin-top: 10px; }
+.codeblock { display: block; padding: 10px; border: 1px dashed #555; margin-top: 6px; word-break: break-all; }
+.hint { font-size: 12px; opacity: 0.85; }
