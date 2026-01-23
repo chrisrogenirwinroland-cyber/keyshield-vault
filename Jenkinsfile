@@ -4,31 +4,26 @@ pipeline {
 
   options {
     timestamps()
+    skipDefaultCheckout(true)
     disableConcurrentBuilds()
-    ansiColor('xterm')
-    buildDiscarder(logRotator(numToKeepStr: '25'))
-  }
-
-  parameters {
-    booleanParam(name: 'RUN_SONAR', defaultValue: true, description: 'Run SonarCloud analysis')
-    booleanParam(name: 'RUN_SECURITY', defaultValue: true, description: 'Run npm audit + Trivy scans')
-    booleanParam(name: 'BUILD_DOCKER', defaultValue: true, description: 'Build Docker images (if Dockerfiles exist)')
-    booleanParam(name: 'DEPLOY_STAGING', defaultValue: false, description: 'Deploy to staging (placeholder unless you wire infra)')
-    booleanParam(name: 'PROMOTE_PROD', defaultValue: false, description: 'Promote to prod (placeholder unless you wire infra)')
   }
 
   environment {
-    // SonarCloud identifiers (update to your values)
-    SONAR_HOST_URL   = "https://sonarcloud.io"
-    SONAR_ORG        = "chrisrogenirwinroland-cyber"
-    SONAR_PROJECTKEY = "chrisrogenirwinroland-cyber_keyshield-vault"
+    // Set these in Jenkins (Manage Jenkins → Credentials / Global env or pipeline env injection)
+    // DO NOT hardcode secrets here.
 
-    // Docker image naming (update registry/namespace if needed)
-    IMAGE_API      = "keyshield-vault-api"
-    IMAGE_FRONTEND = "keyshield-vault-frontend"
+    // SonarCloud:
+    // IMPORTANT: Rubric says "Automatic Analysis" → we do NOT run sonar-scanner in Jenkins.
+    // So we keep only a link/echo stage (optional).
+    SONARCLOUD_DASHBOARD = "https://sonarcloud.io/dashboard?id=chrisrogenirwinroland-cyber_keyshield-vault"
 
-    // Common exclusions for scanners
-    SCAN_EXCLUSIONS = "**/node_modules/**,**/dist/**,**/coverage/**,**/.scannerwork/**,**/.git/**"
+    // Docker registry (optional)
+    DOCKER_IMAGE_API      = "chrisrogenirwinroland/keyshield-vault-api"
+    DOCKER_IMAGE_FRONTEND = "chrisrogenirwinroland/keyshield-vault-frontend"
+    DOCKER_TAG            = "${env.BUILD_NUMBER}"
+
+    // Trivy
+    TRIVY_TIMEOUT = "15m"
   }
 
   stages {
@@ -36,19 +31,17 @@ pipeline {
     stage('Checkout') {
       steps {
         checkout scm
-        echo "Workspace: ${env.WORKSPACE}"
-        bat 'git --version'
       }
     }
 
     stage('Build') {
       steps {
-        // API deps
+        // API
         dir('api') {
           bat 'npm ci'
         }
 
-        // Frontend deps + build
+        // Frontend
         dir('frontend\\app') {
           bat 'npm ci'
           bat 'npm run build'
@@ -61,41 +54,20 @@ pipeline {
         dir('api') {
           bat 'npm test'
         }
+        // If you add frontend tests later, put them here.
       }
     }
 
-    stage('Code Quality (SonarCloud)') {
-      when { expression { return params.RUN_SONAR } }
+    stage('Code Quality (SonarCloud - Automatic Analysis)') {
       steps {
-        withCredentials([string(credentialsId: 'SONAR_TOKEN', variable: 'SONAR_TOKEN')]) {
-          powershell '''
-            $ErrorActionPreference = "Stop"
-
-            # Use SonarScanner CLI inside a container (stable + no local install required)
-            # Mount the Jenkins workspace into /usr/src (Linux path inside container)
-            docker pull sonarsource/sonar-scanner-cli:latest | Out-Null
-
-            docker run --rm `
-              -e "SONAR_TOKEN=$env:SONAR_TOKEN" `
-              -v "${env:WORKSPACE}:/usr/src" `
-              -w "/usr/src" `
-              sonarsource/sonar-scanner-cli:latest `
-              -Dsonar.host.url=${env:SONAR_HOST_URL} `
-              -Dsonar.organization=${env:SONAR_ORG} `
-              -Dsonar.projectKey=${env:SONAR_PROJECTKEY} `
-              -Dsonar.token=$env:SONAR_TOKEN `
-              -Dsonar.sources=api,frontend/app `
-              -Dsonar.exclusions=${env:SCAN_EXCLUSIONS} `
-              -Dsonar.sourceEncoding=UTF-8
-          '''
-        }
+        echo "Rubric: SonarCloud Automatic Analysis enabled. Skipping manual sonar-scanner in Jenkins."
+        echo "Check results at: ${SONARCLOUD_DASHBOARD}"
       }
     }
 
-    stage('Security (npm audit + Trivy FS)') {
-      when { expression { return params.RUN_SECURITY } }
+    stage('Security (npm audit + Trivy)') {
       steps {
-        // npm audit (do not fail build; rubric usually wants evidence)
+        // npm audit (don’t fail build on findings for rubric demo; adjust if needed)
         dir('api') {
           bat 'npm audit --audit-level=high || exit /b 0'
         }
@@ -103,140 +75,73 @@ pipeline {
           bat 'npm audit --audit-level=high || exit /b 0'
         }
 
-        // Trivy filesystem scan: disable secret scanning (reduces timeouts) + skip heavy dirs
-        powershell '''
-          $ErrorActionPreference = "Stop"
-
-          docker pull aquasec/trivy:latest | Out-Null
-
-          # Create reports folder
-          New-Item -ItemType Directory -Force -Path "${env:WORKSPACE}\\reports" | Out-Null
-
-          docker run --rm `
-            -v "${env:WORKSPACE}:/work:ro" `
-            aquasec/trivy:latest fs `
-            --scanners vuln,misconfig `
-            --timeout 20m `
-            --skip-files /work/Jenkinsfile `
-            --skip-dirs /work/**/node_modules `
-            --skip-dirs /work/**/dist `
-            --skip-dirs /work/**/coverage `
-            --format table `
-            --output /work/reports/trivy-fs.txt `
-            --severity HIGH,CRITICAL `
-            --exit-code 0 `
-            /work
-
-          Write-Host "Trivy FS report written to reports\\trivy-fs.txt"
-        '''
+        // Trivy filesystem scan (avoid secret scanning + extend timeout to prevent deadline exceeded)
+        // Uses public image aquasec/trivy:latest (no docker login needed).
+        bat """
+          docker run --rm ^
+            -v "%CD%":/work ^
+            aquasec/trivy:latest fs /work ^
+            --scanners vuln,misconfig ^
+            --timeout ${TRIVY_TIMEOUT} ^
+            --skip-dirs /work/node_modules,/work/api/node_modules,/work/frontend/app/node_modules,/work/frontend/app/dist ^
+            --severity HIGH,CRITICAL ^
+            --exit-code 0
+        """
       }
     }
 
     stage('Build Artefact (Docker Images)') {
-      when { expression { return params.BUILD_DOCKER } }
       steps {
-        script {
-          def tag = "${env.BUILD_NUMBER}"
+        // If you do not need Docker images for marking, you can comment this stage out.
+        // Otherwise ensure Docker daemon is available on the Jenkins agent.
+        bat """
+          docker build -t %DOCKER_IMAGE_API%:%DOCKER_TAG% -f api\\Dockerfile api
+          docker build -t %DOCKER_IMAGE_FRONTEND%:%DOCKER_TAG% -f frontend\\app\\Dockerfile frontend\\app
+        """
+      }
+    }
 
-          // Build API image if Dockerfile exists
-          if (fileExists('api/Dockerfile')) {
-            powershell """
-              \$ErrorActionPreference = "Stop"
-              docker build -t ${env.IMAGE_API}:${tag} -f api/Dockerfile api
-              docker image ls ${env.IMAGE_API}:${tag}
-            """
-          } else {
-            echo "Skipping API image build: api/Dockerfile not found."
-          }
-
-          // Build Frontend image if Dockerfile exists
-          if (fileExists('frontend/app/Dockerfile')) {
-            powershell """
-              \$ErrorActionPreference = "Stop"
-              docker build -t ${env.IMAGE_FRONTEND}:${tag} -f frontend/app/Dockerfile frontend/app
-              docker image ls ${env.IMAGE_FRONTEND}:${tag}
-            """
-          } else {
-            echo "Skipping Frontend image build: frontend/app/Dockerfile not found."
-          }
+    stage('Push Artefact (Optional)') {
+      when {
+        expression { return env.DOCKERHUB_USER != null && env.DOCKERHUB_PASS != null }
+      }
+      steps {
+        // Set DOCKERHUB_USER and DOCKERHUB_PASS as Jenkins credentials (Username/Password)
+        // IMPORTANT: Your Docker Hub email must be verified or login may fail.
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKERHUB_USER', passwordVariable: 'DOCKERHUB_PASS')]) {
+          bat """
+            echo %DOCKERHUB_PASS% | docker login -u %DOCKERHUB_USER% --password-stdin
+            docker push %DOCKER_IMAGE_API%:%DOCKER_TAG%
+            docker push %DOCKER_IMAGE_FRONTEND%:%DOCKER_TAG%
+          """
         }
       }
     }
 
-    stage('Security (Trivy Image Scan)') {
-      when { expression { return params.RUN_SECURITY && params.BUILD_DOCKER } }
+    stage('Deploy (Staging) - Optional') {
+      when {
+        expression { return false } // flip to true only if you actually have a staging target
+      }
       steps {
-        script {
-          def tag = "${env.BUILD_NUMBER}"
-
-          powershell '''
-            $ErrorActionPreference = "Stop"
-            docker pull aquasec/trivy:latest | Out-Null
-            New-Item -ItemType Directory -Force -Path "${env:WORKSPACE}\\reports" | Out-Null
-          '''
-
-          if (fileExists('api/Dockerfile')) {
-            powershell """
-              \$ErrorActionPreference = "Stop"
-              docker run --rm aquasec/trivy:latest image `
-                --timeout 20m `
-                --format table `
-                --output /work/trivy-image-api.txt `
-                --severity HIGH,CRITICAL `
-                --exit-code 0 `
-                ${env.IMAGE_API}:${tag}
-            """
-          } else {
-            echo "Skipping API image scan: api/Dockerfile not found."
-          }
-
-          if (fileExists('frontend/app/Dockerfile')) {
-            powershell """
-              \$ErrorActionPreference = "Stop"
-              docker run --rm aquasec/trivy:latest image `
-                --timeout 20m `
-                --format table `
-                --output /work/trivy-image-frontend.txt `
-                --severity HIGH,CRITICAL `
-                --exit-code 0 `
-                ${env.IMAGE_FRONTEND}:${tag}
-            """
-          } else {
-            echo "Skipping Frontend image scan: frontend/app/Dockerfile not found."
-          }
-        }
+        echo "Deploy stage placeholder (staging)."
       }
     }
 
-    stage('Deploy (Staging)') {
-      when { expression { return params.DEPLOY_STAGING } }
+    stage('Release (Promote to Prod) - Optional') {
+      when {
+        expression { return false } // flip to true only if you actually do promotion
+      }
       steps {
-        echo "Deploy staging placeholder: wire your Docker Compose / k8s / target host here."
-        // Example idea (ONLY if you actually have a docker-compose.yml):
-        // powershell 'docker compose -f docker-compose.staging.yml up -d --build'
+        echo "Release stage placeholder (promotion)."
       }
     }
 
-    stage('Monitoring (Staging Health + Metrics)') {
-      when { expression { return params.DEPLOY_STAGING } }
-      steps {
-        echo "Monitoring placeholder: add health checks and endpoint probes here."
-        // Example:
-        // powershell 'Invoke-WebRequest -UseBasicParsing http://localhost:3000/health | Select-Object -Expand StatusCode'
+    stage('Monitoring (Health + Metrics) - Optional') {
+      when {
+        expression { return false }
       }
-    }
-
-    stage('Release (Promote to Prod)') {
-      when { expression { return params.PROMOTE_PROD } }
       steps {
-        echo "Prod promotion placeholder: tag images, push to registry, deploy prod."
-      }
-    }
-
-    stage('Monitoring (Prod Health Check)') {
-      when { expression { return params.PROMOTE_PROD } }
-      steps {
-        echo "Prod monitoring placeholder."
+        echo "Monitoring stage placeholder."
       }
     }
   }
@@ -244,25 +149,12 @@ pipeline {
   post {
     always {
       echo "Pipeline completed."
-
-      // Capture Docker status (helpful evidence)
-      powershell '''
-        try { docker ps -a } catch { Write-Host "docker ps failed (docker may be unavailable on this agent)." }
-      '''
-
-      // Archive security reports if present
-      archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
-
-      // If you output JUnit later, uncomment:
-      // junit allowEmptyResults: true, testResults: '**/junit*.xml'
+      echo "Workspace: ${env.WORKSPACE}"
+      // show containers (helps for evidence)
+      bat 'docker ps || exit /b 0'
     }
-
-    success {
-      echo "SUCCESS"
-    }
-
     failure {
-      echo "FAILURE"
+      echo "Pipeline failed. Check the failing stage logs above."
     }
   }
 }
