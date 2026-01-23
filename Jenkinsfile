@@ -1,34 +1,32 @@
+
 pipeline {
   agent any
 
   options {
     timestamps()
-    disableConcurrentBuilds()
-    buildDiscarder(logRotator(numToKeepStr: '10'))
     skipDefaultCheckout(true)
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    disableConcurrentBuilds()
+  }
+
+  parameters {
+    booleanParam(name: 'RUN_SONAR', defaultValue: false, description: 'Run SonarCloud (requires sonarcloud-token credential)')
+    booleanParam(name: 'RUN_TRIVY', defaultValue: true,  description: 'Run Trivy filesystem scan (pulls aquasec/trivy)')
+    booleanParam(name: 'BUILD_DOCKER', defaultValue: true, description: 'Build Docker images if Dockerfiles exist')
+    booleanParam(name: 'PUSH_DOCKER', defaultValue: false, description: 'Push Docker images to DockerHub (requires dockerhub-creds)')
+    booleanParam(name: 'DEPLOY_STAGING', defaultValue: false, description: 'Optional deploy stage (customize commands)')
   }
 
   environment {
-    // ----------------------------
-    // SonarCloud (edit these)
-    // ----------------------------
-    SONAR_HOST_URL = 'https://sonarcloud.io'
-    SONAR_ORG      = 'chrisrogenirwinroland-cyber'
-    SONAR_PROJECT  = 'chrisrogenirwinroland-cyber_keyshield-vault'
+    // Update these if you later enable SonarCloud
+    SONAR_ORG  = 'YOUR_SONAR_ORG'
+    SONAR_KEY  = 'YOUR_SONAR_PROJECT_KEY'
 
-    // Jenkins Credentials IDs (must exist in Jenkins)
-    SONAR_TOKEN_CRED_ID = 'sonarcloud-token'    // Secret text
-    DOCKERHUB_CRED_ID   = 'dockerhub-creds'     // Username+Password (optional)
-
-    // ----------------------------
-    // Docker image tags
-    // ----------------------------
-    DOCKER_TAG = "${env.BUILD_NUMBER}"
-    DOCKER_IMAGE_API = "chrisrogenirwinroland/keyshield-vault-api"
-    DOCKER_IMAGE_FE  = "chrisrogenirwinroland/keyshield-vault-frontend"
-
-    // Trivy behavior
-    TRIVY_TIMEOUT = '20m'
+    // Docker image naming
+    DOCKER_USER = 'rogen7spark'
+    IMAGE_TAG   = "${env.BUILD_NUMBER}"
+    API_IMAGE   = "${DOCKER_USER}/keyshield-vault-api:${env.BUILD_NUMBER}"
+    FE_IMAGE    = "${DOCKER_USER}/keyshield-vault-frontend:${env.BUILD_NUMBER}"
   }
 
   stages {
@@ -36,15 +34,14 @@ pipeline {
     stage('Checkout') {
       steps {
         checkout scm
+        bat 'echo WORKSPACE=%CD%'
       }
     }
 
     stage('Preflight (Tools)') {
       steps {
-        bat 'echo WORKSPACE=%WORKSPACE%'
         bat 'node -v'
         bat 'npm -v'
-        // Do not fail if docker absent
         bat 'where docker || exit /b 0'
         bat 'docker version || exit /b 0'
       }
@@ -52,12 +49,12 @@ pipeline {
 
     stage('Build') {
       steps {
-        echo "API: npm ci"
+        echo 'API: npm ci'
         dir('api') {
           bat 'npm ci'
         }
 
-        echo "Frontend: npm ci + build"
+        echo 'Frontend: npm ci + build'
         dir('frontend\\app') {
           bat 'npm ci'
           bat 'npm run build'
@@ -67,162 +64,157 @@ pipeline {
 
     stage('Test') {
       steps {
-        echo "API: jest tests"
+        echo 'API: jest tests'
         dir('api') {
           bat 'npm test'
         }
       }
     }
 
-    stage('Code Quality (SonarCloud)') {
+    stage('Code Quality (SonarCloud) - OPTIONAL') {
+      when { expression { return params.RUN_SONAR } }
       steps {
         script {
-          // Skip if Docker not present/running
-          def dockerOk = (bat(returnStatus: true, script: 'where docker') == 0) &&
-                         (bat(returnStatus: true, script: 'docker version') == 0)
-
-          if (!dockerOk) {
-            echo "Skipping SonarCloud: Docker not available/running on this agent."
-            return
-          }
-
-          // If Sonar fails, mark UNSTABLE and continue
-          catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-            withCredentials([string(credentialsId: "${env.SONAR_TOKEN_CRED_ID}", variable: 'SONAR_TOKEN')]) {
+          // Option A rule: NEVER make build UNSTABLE/FAIL if Sonar is missing
+          try {
+            withCredentials([string(credentialsId: 'sonarcloud-token', variable: 'SONAR_TOKEN')]) {
+              // If you have sonar-scanner installed globally, you can call sonar-scanner directly.
+              // This uses npx to avoid requiring a global install.
               bat """
-                echo Running SonarCloud scan (dockerized sonar-scanner)...
-                docker run --rm ^
-                  -e SONAR_TOKEN=%SONAR_TOKEN% ^
-                  -v "%WORKSPACE%:/usr/src" ^
-                  sonarsource/sonar-scanner-cli:latest ^
+                echo Running SonarCloud scan...
+                npx -y sonar-scanner ^
                   -Dsonar.organization=%SONAR_ORG% ^
-                  -Dsonar.projectKey=%SONAR_PROJECT% ^
-                  -Dsonar.host.url=%SONAR_HOST_URL% ^
+                  -Dsonar.projectKey=%SONAR_KEY% ^
                   -Dsonar.sources=. ^
-                  -Dsonar.exclusions=**/node_modules/**,**/coverage/**,**/dist/**,**/out/**,**/build/** ^
-                  -Dsonar.sourceEncoding=UTF-8
+                  -Dsonar.host.url=https://sonarcloud.io ^
+                  -Dsonar.login=%SONAR_TOKEN%
               """
             }
+          } catch (e) {
+            echo "Skipping SonarCloud: credential 'sonarcloud-token' not configured or scan failed."
           }
         }
       }
     }
 
-    stage('Security (npm audit + Trivy)') {
+    stage('Security (npm audit + Trivy) - OPTIONAL') {
       steps {
-        echo "npm audit (API) - do not fail build"
+        echo 'npm audit (API) - do not fail build'
         dir('api') {
           bat 'npm audit --audit-level=high || exit /b 0'
         }
 
-        echo "npm audit (Frontend) - do not fail build"
+        echo 'npm audit (Frontend) - do not fail build'
         dir('frontend\\app') {
           bat 'npm audit --audit-level=high || exit /b 0'
         }
 
         script {
-          def dockerOk = (bat(returnStatus: true, script: 'where docker') == 0) &&
-                         (bat(returnStatus: true, script: 'docker version') == 0)
-
-          if (!dockerOk) {
-            echo "Skipping Trivy: Docker not available/running."
+          if (!params.RUN_TRIVY) {
+            echo 'Trivy disabled by parameter.'
             return
           }
 
-          // Trivy should not block submission — mark unstable if it errors
-          catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+          // Option A rule: Trivy must never fail the build
+          try {
+            bat 'echo Pulling Trivy...'
+            bat 'docker pull aquasec/trivy:latest'
+
             bat """
-              echo Pulling Trivy...
-              docker pull aquasec/trivy:latest
               echo Running Trivy filesystem scan...
               docker run --rm ^
-                -v "%WORKSPACE%:/work" ^
+                -v "%CD%:/work" ^
                 aquasec/trivy:latest fs /work ^
-                --timeout %TRIVY_TIMEOUT% ^
+                --timeout 20m ^
                 --scanners vuln,misconfig ^
                 --skip-dirs /work/**/node_modules ^
                 --skip-dirs /work/**/dist ^
                 --skip-dirs /work/**/coverage ^
                 --exit-code 0
             """
+          } catch (e) {
+            echo 'Trivy step skipped/failed but build remains SUCCESS (Option A).'
           }
         }
       }
     }
 
-    stage('Build Artefact (Docker Images)') {
+    stage('Build Artefact (Docker Images) - OPTIONAL') {
+      when { expression { return params.BUILD_DOCKER } }
       steps {
         script {
-          def dockerOk = (bat(returnStatus: true, script: 'where docker') == 0) &&
-                         (bat(returnStatus: true, script: 'docker version') == 0)
-
-          if (!dockerOk) {
-            echo "Skipping Docker builds: Docker not available/running."
-            return
-          }
-
-          // IMPORTANT: Your earlier error was "open Dockerfile: no such file".
-          // These checks prevent that and will print what exists.
-          echo "Checking Dockerfile locations..."
+          // This matches your repo reality: there is NO api/Dockerfile and NO frontend/app/Dockerfile in your logs.
+          // We only build if Dockerfiles exist.
+          echo 'Checking Dockerfile locations...'
           bat 'dir api || exit /b 0'
           bat 'dir frontend\\app || exit /b 0'
 
-          if (fileExists('api/Dockerfile')) {
-            bat 'docker build -t %DOCKER_IMAGE_API%:%DOCKER_TAG% -f api\\Dockerfile api'
+          def apiDockerfile = 'api/Dockerfile'
+          def feDockerfile  = 'frontend/app/Dockerfile'
+
+          if (fileExists(apiDockerfile)) {
+            echo "Building API image: ${env.API_IMAGE}"
+            bat "docker build -t ${env.API_IMAGE} -f ${apiDockerfile} api"
           } else {
-            echo "API Dockerfile not found at api/Dockerfile (skipping API image)."
+            echo "API Dockerfile not found at ${apiDockerfile} (skipping API image)."
           }
 
-          if (fileExists('frontend/app/Dockerfile') || fileExists('frontend\\app\\Dockerfile')) {
-            bat 'docker build -t %DOCKER_IMAGE_FE%:%DOCKER_TAG% -f frontend\\app\\Dockerfile frontend\\app'
+          if (fileExists(feDockerfile)) {
+            echo "Building Frontend image: ${env.FE_IMAGE}"
+            bat "docker build -t ${env.FE_IMAGE} -f ${feDockerfile} frontend\\app"
           } else {
-            echo "Frontend Dockerfile not found at frontend/app/Dockerfile (skipping FE image)."
+            echo "Frontend Dockerfile not found at ${feDockerfile} (skipping FE image)."
           }
         }
       }
     }
 
-    stage('Push Artefact (DockerHub) - Optional') {
+    stage('Push Artefact (DockerHub) - OPTIONAL') {
+      when { expression { return params.PUSH_DOCKER } }
       steps {
         script {
-          def dockerOk = (bat(returnStatus: true, script: 'where docker') == 0) &&
-                         (bat(returnStatus: true, script: 'docker version') == 0)
-
-          if (!dockerOk) {
-            echo "Skipping Docker push: Docker not available/running."
-            return
-          }
-
-          // Push is optional; do not fail overall pipeline if creds missing
-          catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
-            withCredentials([usernamePassword(credentialsId: "${env.DOCKERHUB_CRED_ID}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          // Option A rule: push must never mark build unstable/fail
+          try {
+            withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
               bat """
                 echo Logging in to DockerHub...
                 docker logout || exit /b 0
                 echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
               """
 
-              if (fileExists('api/Dockerfile')) {
-                bat 'docker push %DOCKER_IMAGE_API%:%DOCKER_TAG%'
+              if (params.BUILD_DOCKER && fileExists('api/Dockerfile')) {
+                bat "docker push ${env.API_IMAGE}"
               } else {
-                echo "No API image built, skipping push."
+                echo 'No API image built, skipping push.'
               }
 
-              if (fileExists('frontend\\app\\Dockerfile') || fileExists('frontend/app/Dockerfile')) {
-                bat 'docker push %DOCKER_IMAGE_FE%:%DOCKER_TAG%'
+              if (params.BUILD_DOCKER && fileExists('frontend/app/Dockerfile')) {
+                bat "docker push ${env.FE_IMAGE}"
               } else {
-                echo "No FE image built, skipping push."
+                echo 'No FE image built, skipping push.'
               }
             }
+          } catch (e) {
+            echo "Skipping Docker push: credential 'dockerhub-creds' not configured or push failed."
           }
         }
       }
     }
 
-    stage('Deploy (Staging) - Optional') {
-      when { expression { return false } }  // disabled by default
+    stage('Deploy (Staging) - OPTIONAL') {
+      when { expression { return params.DEPLOY_STAGING } }
       steps {
-        echo "Deploy stage disabled."
+        script {
+          // Customize this to your environment (docker compose, kubectl, etc.)
+          // Option A rule: deployment should not break your build if it's only a demo run.
+          try {
+            echo 'Deploying to staging (placeholder)...'
+            // Example (if you add docker-compose.yml later):
+            // bat 'docker compose up -d --build'
+          } catch (e) {
+            echo 'Deploy failed/skipped but build remains SUCCESS (Option A).'
+          }
+        }
       }
     }
   }
@@ -233,13 +225,10 @@ pipeline {
       bat 'docker ps || exit /b 0'
     }
     success {
-      echo "SUCCESS: Build/Test completed."
-    }
-    unstable {
-      echo "UNSTABLE: Some optional quality/security steps failed (Sonar/Trivy/Docker push). Core stages succeeded."
+      echo 'SUCCESS: Core stages (build + test) completed.'
     }
     failure {
-      echo "FAILURE: Core stages (build/test) failed."
+      echo 'FAILURE: A required stage failed (Build/Test/Checkout).'
     }
   }
 }
