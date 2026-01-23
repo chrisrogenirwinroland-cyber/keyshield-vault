@@ -1,0 +1,68 @@
+<div class="wrap">
+  <h1>KeyShield Vault — Admin</h1>
+
+  <div class="nav">
+     <a routerLink="/admin">Admin</a> |
+     <a routerLink="/client">Client</a>
+  </div>
+
+
+
+  <div class="card">
+    <h2>Login (simple)</h2>
+    <div class="row">
+      <label>Username</label>
+      <input [(ngModel)]="username" />
+    </div>
+    <div class="row">
+      <label>Password</label>
+      <input [(ngModel)]="password" type="password" />
+    </div>
+    <button (click)="login()" [disabled]="loading">Login</button>
+    <button (click)="logout()" [disabled]="loading">Logout</button>
+
+    <p *ngIf="api.token">Token: <code>{{ tokenPreview }}</code></p>
+    <p class="err" *ngIf="error">{{ error }}</p>
+  </div>
+
+  <div class="card" *ngIf="api.token">
+    <h2>Create API Key</h2>
+    <div class="row">
+      <label>Label</label>
+      <input [(ngModel)]="label" />
+    </div>
+    <button (click)="createKey()" [disabled]="loading">Generate Key</button>
+
+    <div *ngIf="rawKeyOnce" class="ok">
+      <p><strong>Raw key (shown once):</strong></p>
+      <code class="codeblock">{{ rawKeyOnce }}</code>
+      <p class="hint">Copy this value for the Client page. It will be rotated after use.</p>
+    </div>
+  </div>
+
+  <div class="card" *ngIf="api.token">
+    <h2>Existing Keys</h2>
+    <button (click)="refreshKeys()" [disabled]="loading">Refresh</button>
+
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>Label</th><th>Status</th><th>Last4</th><th>Rotations</th><th>Last Used</th><th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr *ngFor="let k of keys">
+          <td>{{k.id}}</td>
+          <td>{{k.label}}</td>
+          <td>{{k.status}}</td>
+          <td>****{{k.key_last4}}</td>
+          <td>{{k.rotation_count}}</td>
+          <td>{{k.last_used_at || '-'}}</td>
+          <td>
+            <button (click)="revoke(k.id)" [disabled]="loading || k.status !== 'ACTIVE'">Revoke</button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
