@@ -1,0 +1,23 @@
+services:
+  api:
+    build: ./api
+    container_name: keyshield-api
+    ports:
+      - "3000:3000"
+    environment:
+      - JWT_SECRET=dev-secret-change-me
+    volumes:
+      - api_data:/app/data
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend/app
+    container_name: keyshield-frontend
+    ports:
+      - "4200:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  api_data:
