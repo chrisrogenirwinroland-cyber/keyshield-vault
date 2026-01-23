@@ -1,24 +1,42 @@
 pipeline {
   agent any
+
   options {
     timestamps()
     disableConcurrentBuilds()
   }
 
   environment {
-    // Versioning
-    GIT_SHA = "${env.GIT_COMMIT}".take(7)
-    VERSION = "${env.BUILD_NUMBER}-${GIT_SHA}"
+    // ---- Container names ----
+    API_STAGING_NAME   = "keyshield-api-staging"
+    API_PROD_NAME      = "keyshield-api-prod"
 
-    // SonarCloud config (set these in Jenkins credentials or hardcode)
-    SONAR_HOST_URL = "https://sonarcloud.io"
-    // If you prefer hardcode org/key, set SONAR_ORG and SONAR_PROJECT_KEY here.
-    SONAR_ORG = credentials('SONAR_ORG')        // Secret text: your sonar org
-    SONAR_TOKEN = credentials('SONAR_TOKEN')    // Secret text: token
+    WEB_STAGING_NAME   = "keyshield-web-staging"
+    WEB_PROD_NAME      = "keyshield-web-prod"
 
-    // Docker image names (must match your docker-compose.yml service image names or tags)
-    API_IMAGE = "keyshield-vault-api"
-    FE_IMAGE  = "keyshield-vault-frontend"
+    // ---- Ports on Jenkins host ----
+    API_STAGING_PORT   = "3000"
+    API_PROD_PORT      = "3001"
+
+    WEB_STAGING_PORT   = "4200"
+    WEB_PROD_PORT      = "4201"
+
+    // ---- Ports inside containers ----
+    API_CONTAINER_PORT = "3000"
+    WEB_CONTAINER_PORT = "80"
+
+    // ---- Docker image tags ----
+    API_IMAGE_BUILD    = "keyshield-vault-api:${BUILD_NUMBER}"
+    API_IMAGE_RELEASE  = "keyshield-vault-api:release-${BUILD_NUMBER}"
+
+    WEB_IMAGE_BUILD    = "keyshield-vault-frontend:${BUILD_NUMBER}"
+    WEB_IMAGE_RELEASE  = "keyshield-vault-frontend:release-${BUILD_NUMBER}"
+
+    // SonarQube URL (local SonarQube)
+    // If you run SonarQube in Docker on the same machine: http://host.docker.internal:9000 works on Windows.
+    SONAR_HOST_URL     = "http://host.docker.internal:9000"
+    SONAR_PROJECT_KEY  = "KeyShield-Vault"
+    SONAR_PROJECT_NAME = "KeyShield-Vault"
   }
 
   stages {
@@ -26,122 +44,202 @@ pipeline {
     stage('Checkout') {
       steps {
         checkout scm
-        sh 'git rev-parse --short HEAD || true'
       }
     }
 
-    stage('Build') {
-      steps {
-        echo "Building Docker images for VERSION=${VERSION}"
-        // Build images (artifact = Docker images)
-        sh 'docker compose version'
-        sh 'docker compose build --no-cache'
-        sh 'docker images | head -n 20'
-      }
-    }
-
-    stage('Test') {
+    // ----------------------------
+    // BUILD
+    // ----------------------------
+    stage('Build (Dependencies)') {
       steps {
         dir('api') {
-          sh 'node -v'
-          sh 'npm -v'
-          sh 'npm ci'
-          // Ensure jest outputs junit.xml (configure in package.json or run with reporter)
-          // If you already added jest-junit, this will create junit.xml in api/
-          sh 'npm test'
+          bat 'npm ci'
         }
-      }
-      post {
-        always {
-          // If your junit file is elsewhere, adjust path
-          junit allowEmptyResults: true, testResults: 'api/junit.xml'
+        dir('frontend\\app') {
+          bat 'npm ci'
         }
       }
     }
 
-    stage('Code Quality') {
+    // ----------------------------
+    // TEST
+    // ----------------------------
+    stage('Test (Jest)') {
       steps {
-        echo "Running lint + SonarCloud scan"
         dir('api') {
-          sh 'npm ci'
-          // ESLint (real code-quality signal). If no eslint configured, add quickly or keep non-blocking.
-          sh 'npm run lint || true'
+          bat 'npm test'
         }
-
-        // SonarCloud scan (real tool)
-        // Requires sonar-project.properties in repo root OR you pass properties inline.
-        // Fastest path: create sonar-project.properties (I can give you file content if needed).
-        sh """
-          docker run --rm \
-            -e SONAR_HOST_URL=${SONAR_HOST_URL} \
-            -e SONAR_TOKEN=${SONAR_TOKEN} \
-            -v "\$PWD:/usr/src" \
-            sonarsource/sonar-scanner-cli:latest
-        """
       }
     }
 
-    stage('Security') {
+    // ----------------------------
+    // CODE QUALITY (SonarQube via Docker scanner)
+    // ----------------------------
+    stage('Code Quality (SonarQube Scan - Docker)') {
+      environment {
+        // Create Jenkins credential (Secret text) with id: sonar-token
+        SONAR_TOKEN = credentials('sonar-token')
+      }
       steps {
-        echo "Dependency security scan (npm audit) + container image scan (Trivy)"
+        powershell '''
+          $args = @(
+            "run","--rm",
+            "-e","SONAR_HOST_URL=$env:SONAR_HOST_URL",
+            "-e","SONAR_TOKEN=$env:SONAR_TOKEN",
+            "-v","$env:WORKSPACE`:/usr/src",
+            "-w","/usr/src",
+            "sonarsource/sonar-scanner-cli:latest",
+            "-Dsonar.projectKey=$env:SONAR_PROJECT_KEY",
+            "-Dsonar.projectName=$env:SONAR_PROJECT_NAME",
+            "-Dsonar.sources=api,frontend/app/src",
+            "-Dsonar.exclusions=**/node_modules/**,**/coverage/**,**/dist/**",
+            "-Dsonar.login=$env:SONAR_TOKEN"
+          )
+          & docker @args
+        '''
+      }
+    }
+
+    // ----------------------------
+    // SECURITY
+    // ----------------------------
+    stage('Security (npm audit + Trivy)') {
+      steps {
         dir('api') {
-          sh 'npm ci'
-          // Fail only on high/critical if you want gating; keep as non-blocking if time is tight:
-          sh 'npm audit --audit-level=high || true'
+          // Don’t fail the whole build if audit finds issues; you will explain in report
+          bat 'npm audit --audit-level=high || exit /b 0'
         }
 
-        // Trivy image scan (real tool). Scans built images.
-        // If Trivy not installed, we run it via docker image.
-        sh """
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest image --severity HIGH,CRITICAL --no-progress ${API_IMAGE}:latest || true
-        """
+        // Trivy image scan after image build stage will be more meaningful,
+        // but we can also do FS scan now if you want.
       }
     }
 
-    stage('Deploy') {
+    // ----------------------------
+    // BUILD ARTEFACTS (Docker Images)
+    // ----------------------------
+    stage('Build Artefact (Docker Images)') {
       steps {
-        echo "Deploying to STAGING via docker compose"
-        sh 'docker compose up -d'
-        // Health check
-        sh 'sleep 3'
-        sh 'curl -sSf http://localhost:3000/health'
+        // API image
+        powershell '''
+          docker build -t $env:API_IMAGE_BUILD -f api\\Dockerfile api
+          docker images | Select-String keyshield-vault-api
+        '''
+
+        // Frontend image
+        powershell '''
+          docker build -t $env:WEB_IMAGE_BUILD -f frontend\\app\\Dockerfile frontend\\app
+          docker images | Select-String keyshield-vault-frontend
+        '''
+
+        // Optional: Trivy scan the built images (real security tool)
+        powershell '''
+          docker run --rm aquasec/trivy:latest image $env:API_IMAGE_BUILD  | Out-Host
+          docker run --rm aquasec/trivy:latest image $env:WEB_IMAGE_BUILD  | Out-Host
+        '''
       }
     }
 
-    stage('Release') {
+    // ----------------------------
+    // DEPLOY (STAGING)
+    // ----------------------------
+    stage('Deploy (Staging)') {
       steps {
-        echo "Tagging images for release VERSION=${VERSION}"
-        sh "docker tag ${API_IMAGE}:latest ${API_IMAGE}:${VERSION}"
-        sh "docker tag ${FE_IMAGE}:latest ${FE_IMAGE}:${VERSION}"
+        powershell '''
+          # API staging
+          docker stop $env:API_STAGING_NAME 2>$null
+          docker rm   $env:API_STAGING_NAME 2>$null
+          docker run -d --name $env:API_STAGING_NAME -p "$env:API_STAGING_PORT`:$env:API_CONTAINER_PORT" $env:API_IMAGE_BUILD
+          docker ps | Select-String $env:API_STAGING_NAME
 
-        // Optional: also create a Git tag (requires Jenkins has push rights).
-        // If you don't have GITHUB_TOKEN configured, keep it local and document in report.
-        sh """
-          git tag -a v${VERSION} -m "Release v${VERSION}" || true
-          git tag --list | tail -n 5
-        """
+          # Web staging
+          docker stop $env:WEB_STAGING_NAME 2>$null
+          docker rm   $env:WEB_STAGING_NAME 2>$null
+          docker run -d --name $env:WEB_STAGING_NAME -p "$env:WEB_STAGING_PORT`:$env:WEB_CONTAINER_PORT" $env:WEB_IMAGE_BUILD
+          docker ps | Select-String $env:WEB_STAGING_NAME
+        '''
       }
     }
 
-    stage('Monitoring') {
+    // ----------------------------
+    // MONITORING (STAGING)
+    // ----------------------------
+    stage('Monitoring (Staging Health + Metrics)') {
       steps {
-        echo "Monitoring validation: /metrics must be reachable"
-        sh 'curl -sSf http://localhost:3000/metrics | head -n 30'
-        echo "Monitoring OK: metrics endpoint reachable"
+        powershell '''
+          Start-Sleep -Seconds 3
+
+          Write-Host "STAGING API /health"
+          $resp = Invoke-RestMethod http://localhost:$env:API_STAGING_PORT/health
+          $resp | ConvertTo-Json -Compress | Write-Host
+
+          Write-Host "STAGING API /metrics (first 10 lines)"
+          $m = Invoke-WebRequest http://localhost:$env:API_STAGING_PORT/metrics
+          ($m.Content -split "`n" | Select-Object -First 10) | ForEach-Object { Write-Host $_ }
+        '''
+      }
+    }
+
+    // ----------------------------
+    // RELEASE (PROMOTE TO PROD)
+    // ----------------------------
+    stage('Release (Promote to Prod)') {
+      steps {
+        powershell '''
+          docker tag $env:API_IMAGE_BUILD $env:API_IMAGE_RELEASE
+          docker tag $env:WEB_IMAGE_BUILD $env:WEB_IMAGE_RELEASE
+
+          # API prod
+          docker stop $env:API_PROD_NAME 2>$null
+          docker rm   $env:API_PROD_NAME 2>$null
+          docker run -d --name $env:API_PROD_NAME -p "$env:API_PROD_PORT`:$env:API_CONTAINER_PORT" $env:API_IMAGE_RELEASE
+          docker ps | Select-String $env:API_PROD_NAME
+
+          # Web prod
+          docker stop $env:WEB_PROD_NAME 2>$null
+          docker rm   $env:WEB_PROD_NAME 2>$null
+          docker run -d --name $env:WEB_PROD_NAME -p "$env:WEB_PROD_PORT`:$env:WEB_CONTAINER_PORT" $env:WEB_IMAGE_RELEASE
+          docker ps | Select-String $env:WEB_PROD_NAME
+        '''
+      }
+    }
+
+    // ----------------------------
+    // MONITORING (PROD)
+    // ----------------------------
+    stage('Monitoring (Prod Health Check)') {
+      steps {
+        powershell '''
+          Start-Sleep -Seconds 3
+          try {
+            Write-Host "PROD API /health"
+            $resp = Invoke-RestMethod http://localhost:$env:API_PROD_PORT/health
+            $resp | ConvertTo-Json -Compress | Write-Host
+
+            Write-Host "PROD API /metrics (first 10 lines)"
+            $m = Invoke-WebRequest http://localhost:$env:API_PROD_PORT/metrics
+            ($m.Content -split "`n" | Select-Object -First 10) | ForEach-Object { Write-Host $_ }
+          } catch {
+            Write-Host "ALERT: PROD health/metrics check FAILED"
+            exit 1
+          }
+        '''
       }
     }
   }
 
   post {
     always {
-      echo "Post: docker compose ps"
-      sh 'docker compose ps || true'
-      // Keep environment clean for re-runs
-      sh 'docker compose logs --no-color --tail=80 || true'
-    }
-    cleanup {
-      sh 'docker compose down --remove-orphans || true'
+      echo "Pipeline completed."
+
+      // Avoid the MissingContextVariableException by NOT calling sh/bat here unless workspace exists
+      script {
+        if (env.WORKSPACE) {
+          echo "Workspace OK: ${env.WORKSPACE}"
+        } else {
+          echo "No workspace context in post; skipping shell cleanup."
+        }
+      }
     }
   }
 }
