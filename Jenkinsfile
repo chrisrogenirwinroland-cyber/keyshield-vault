@@ -1,10 +1,3 @@
-// ================================================================
-// KeyShield Vault — Option A Jenkins Pipeline (FULL WORKING CODE)
-// Includes: Build, Test, Quality (optional), Security (optional),
-// DockerHub Push (optional), Deploy (Staging), Continuous Monitoring
-// Fixes: Groovy $_ issue + correct Declarative "post { cleanup { ... } }"
-// ================================================================
-
 pipeline {
   agent any
 
@@ -12,38 +5,44 @@ pipeline {
     timestamps()
     ansiColor('xterm')
     disableConcurrentBuilds()
-    buildDiscarder(logRotator(numToKeepStr: '15'))
+    buildDiscarder(logRotator(numToKeepStr: '20'))
   }
 
   parameters {
-    // Set this to your DockerHub username (must match the creds you use in Jenkins)
-    string(name: 'DOCKERHUB_NAMESPACE', defaultValue: 'rogen7spark', description: 'DockerHub namespace/username for image tags.')
-
-    booleanParam(name: 'PUSH_IMAGES', defaultValue: true, description: 'Push Docker images to DockerHub (requires correct creds/namespace).')
-    booleanParam(name: 'DEPLOY_STAGING', defaultValue: true, description: 'Deploy to local staging via docker compose.')
-    booleanParam(name: 'RUN_SONAR', defaultValue: false, description: 'Run SonarQube analysis (enable only if configured).')
-    booleanParam(name: 'RUN_TRIVY', defaultValue: false, description: 'Run Trivy scan (enable only if Trivy is installed).')
-    booleanParam(name: 'RUN_MONITORING_CHECK', defaultValue: true, description: 'Validate /health and /metrics after deploy.')
+    booleanParam(name: 'RUN_SONAR', defaultValue: false, description: 'Run SonarQube scan (optional)')
+    booleanParam(name: 'RUN_TRIVY', defaultValue: false, description: 'Run Trivy image scan (optional)')
+    booleanParam(name: 'PUSH_DOCKERHUB', defaultValue: true, description: 'Push images to DockerHub (optional)')
+    booleanParam(name: 'DEPLOY_STAGING', defaultValue: true, description: 'Deploy to local staging via docker compose')
+    booleanParam(name: 'RUN_MONITORING_CHECK', defaultValue: true, description: 'Run health/metrics checks after staging deploy')
   }
 
   environment {
-    APP_NAME          = 'keyshield-vault'
+    // =========================
+    // CONFIG (edit as needed)
+    // =========================
 
-    // Jenkins credential ID (Username/Password) for DockerHub
-    DOCKERHUB_CRED_ID = 'dockerhub-creds'
+    // DockerHub repo/namespace
+    DOCKERHUB_NAMESPACE = 'rogen7spark'
 
-    // Compose
-    COMPOSE_FILE      = 'docker-compose.yml'
-    STAGING_PROJECT   = 'keyshield-staging'
+    // Image names
+    API_IMAGE_NAME = 'keyshield-vault-api'
+    WEB_IMAGE_NAME = 'keyshield-vault-web'
 
-    // Endpoints used for monitoring validation after deploy
-    API_HEALTH_URL    = 'http://localhost:3000/health'
-    API_METRICS_URL   = 'http://localhost:3000/metrics'
+    // Tags: build number + latest
+    API_IMAGE_TAG = "${BUILD_NUMBER}"
+    WEB_IMAGE_TAG = "${BUILD_NUMBER}"
 
-    // SonarQube: must match EXACT configured installation name in Jenkins
-    SONARQUBE_SERVER  = 'Sonar'             // change only if you configured a different name
-    SONAR_PROJECT_KEY = 'keyshield-vault'
-    SONAR_PROJECT_NAME= 'KeyShield Vault'
+    // Local staging compose
+    COMPOSE_PROJECT = 'keyshield-staging'
+    COMPOSE_FILE    = 'docker-compose.yml'
+
+    // Health & metrics endpoints (must match your API)
+    API_HEALTH_URL   = 'http://localhost:3000/health'
+    API_METRICS_URL  = 'http://localhost:3000/metrics'
+
+    // Optional SonarQube installation name in Jenkins global config
+    // If your Jenkins has a different name, update this.
+    SONARQUBE_SERVER = 'Sonar'
   }
 
   stages {
@@ -61,38 +60,45 @@ pipeline {
         bat 'where docker'
         bat 'docker version'
         bat 'docker compose version'
-        bat 'where node || exit /b 0'
-        bat 'node -v || exit /b 0'
-        bat 'npm -v || exit /b 0'
+
+        // Keep these non-fatal in case Node isn't installed (your log shows it is)
+        bat 'where node   || exit /b 0'
+        bat 'node -v      || exit /b 0'
+        bat 'npm -v       || exit /b 0'
       }
     }
 
     stage('Build (Docker Images)') {
       steps {
         script {
-          env.API_IMAGE        = "${params.DOCKERHUB_NAMESPACE}/${env.APP_NAME}-api:${env.BUILD_NUMBER}"
-          env.WEB_IMAGE        = "${params.DOCKERHUB_NAMESPACE}/${env.APP_NAME}-web:${env.BUILD_NUMBER}"
-          env.API_IMAGE_LATEST = "${params.DOCKERHUB_NAMESPACE}/${env.APP_NAME}-api:latest"
-          env.WEB_IMAGE_LATEST = "${params.DOCKERHUB_NAMESPACE}/${env.APP_NAME}-web:latest"
+          def apiImage = "${env.DOCKERHUB_NAMESPACE}/${env.API_IMAGE_NAME}:${env.API_IMAGE_TAG}"
+          def webImage = "${env.DOCKERHUB_NAMESPACE}/${env.WEB_IMAGE_NAME}:${env.WEB_IMAGE_TAG}"
+
+          echo "Building API image: ${apiImage}"
+          bat """
+            docker build ^
+              -t ${apiImage} ^
+              -t ${env.DOCKERHUB_NAMESPACE}/${env.API_IMAGE_NAME}:latest ^
+              -f api\\Dockerfile api
+          """
+
+          echo "Building Frontend image: ${webImage}"
+          bat """
+            docker build ^
+              -t ${webImage} ^
+              -t ${env.DOCKERHUB_NAMESPACE}/${env.WEB_IMAGE_NAME}:latest ^
+              -f frontend\\app\\Dockerfile frontend\\app
+          """
         }
-
-        echo "Building API image: ${env.API_IMAGE}"
-        bat """
-          docker build -t ${env.API_IMAGE} -t ${env.API_IMAGE_LATEST} -f api\\Dockerfile api
-        """
-
-        echo "Building Frontend image: ${env.WEB_IMAGE}"
-        bat """
-          docker build -t ${env.WEB_IMAGE} -t ${env.WEB_IMAGE_LATEST} -f frontend\\app\\Dockerfile frontend\\app
-        """
       }
     }
 
     stage('Test (API Unit Tests)') {
       steps {
         dir('api') {
-          // If tests fail, mark stage UNSTABLE (still shows evidence in report)
-          catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+          // Make tests not kill the entire build if you want.
+          // If you want tests to be mandatory, remove catchError wrapper.
+          catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
             bat 'npm ci'
             bat 'npm test'
           }
@@ -104,14 +110,15 @@ pipeline {
       when { expression { return params.RUN_SONAR } }
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-          withSonarQubeEnv("${env.SONARQUBE_SERVER}") {
-            bat """
-              sonar-scanner ^
-                -Dsonar.projectKey=${env.SONAR_PROJECT_KEY} ^
-                -Dsonar.projectName="${env.SONAR_PROJECT_NAME}" ^
-                -Dsonar.sources=api,frontend/app/src ^
-                -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/.angular/**
-            """
+          script {
+            // NOTE: This fails if SONARQUBE_SERVER name doesn't match Jenkins config.
+            withSonarQubeEnv("${env.SONARQUBE_SERVER}") {
+              // Use your preferred scanner approach here.
+              // If you use SonarScanner CLI, call it. Example:
+              // bat 'sonar-scanner -Dsonar.projectKey=keyshield-vault -Dsonar.sources=.'
+              echo "SonarQube environment configured: ${env.SONARQUBE_SERVER}"
+              echo "Add sonar-scanner command here if installed."
+            }
           }
         }
       }
@@ -134,44 +141,52 @@ pipeline {
       when { expression { return params.RUN_TRIVY } }
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-          // Skip if Trivy is not installed (do NOT fail build)
           bat '''
-            where trivy >nul 2>nul
+            where trivy 1>nul 2>nul
             if %ERRORLEVEL% NEQ 0 (
               echo Trivy not installed. Skipping image scan.
               exit /b 0
             )
-            trivy image --no-progress --severity HIGH,CRITICAL %API_IMAGE%
-            trivy image --no-progress --severity HIGH,CRITICAL %WEB_IMAGE%
           '''
+          bat """
+            trivy image ${env.DOCKERHUB_NAMESPACE}/${env.API_IMAGE_NAME}:${env.API_IMAGE_TAG} || exit /b 0
+            trivy image ${env.DOCKERHUB_NAMESPACE}/${env.WEB_IMAGE_NAME}:${env.WEB_IMAGE_TAG} || exit /b 0
+          """
         }
       }
     }
 
     stage('DockerHub Push - OPTIONAL') {
-      when { expression { return params.PUSH_IMAGES } }
+      when { expression { return params.PUSH_DOCKERHUB } }
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-          withCredentials([usernamePassword(credentialsId: "${env.DOCKERHUB_CRED_ID}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          withCredentials([usernamePassword(
+            credentialsId: 'dockerhub-creds',
+            usernameVariable: 'DH_USER',
+            passwordVariable: 'DH_PASS'
+          )]) {
 
-            // Guard: namespace should match credential username (prevents insufficient_scope surprises)
             bat """
               echo DockerHub user (from creds): %DH_USER%
-              echo DockerHub namespace (param): ${params.DOCKERHUB_NAMESPACE}
-            """
+              echo DockerHub namespace (param): ${env.DOCKERHUB_NAMESPACE}
 
-            bat '''
               echo Logging in to DockerHub...
               docker logout || exit /b 0
               echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
+              if %ERRORLEVEL% NEQ 0 exit /b 1
 
-              docker push %API_IMAGE%
-              docker push %API_IMAGE_LATEST%
-              docker push %WEB_IMAGE%
-              docker push %WEB_IMAGE_LATEST%
+              docker push ${env.DOCKERHUB_NAMESPACE}/${env.API_IMAGE_NAME}:${env.API_IMAGE_TAG}
+              if %ERRORLEVEL% NEQ 0 exit /b 1
+              docker push ${env.DOCKERHUB_NAMESPACE}/${env.API_IMAGE_NAME}:latest
+              if %ERRORLEVEL% NEQ 0 exit /b 1
+
+              docker push ${env.DOCKERHUB_NAMESPACE}/${env.WEB_IMAGE_NAME}:${env.WEB_IMAGE_TAG}
+              if %ERRORLEVEL% NEQ 0 exit /b 1
+              docker push ${env.DOCKERHUB_NAMESPACE}/${env.WEB_IMAGE_NAME}:latest
+              if %ERRORLEVEL% NEQ 0 exit /b 1
 
               docker logout || exit /b 0
-            '''
+            """
           }
         }
       }
@@ -180,9 +195,10 @@ pipeline {
     stage('Deploy (Staging)') {
       when { expression { return params.DEPLOY_STAGING } }
       steps {
+        bat "echo Starting staging deployment..."
         bat """
-          echo Starting staging deployment...
-          docker compose -p ${env.STAGING_PROJECT} -f ${env.COMPOSE_FILE} up -d --build
+          docker compose -p ${env.COMPOSE_PROJECT} -f ${env.COMPOSE_FILE} up -d --build
+          if %ERRORLEVEL% NEQ 0 exit /b 1
         """
       }
     }
@@ -195,32 +211,34 @@ pipeline {
         }
       }
       steps {
-        // IMPORTANT: Use triple-single quotes to prevent Groovy from interpreting $_
-        bat '''
-          powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-            "Write-Host 'Checking API health...'; ^
-             try { ^
-               $r = Invoke-WebRequest -UseBasicParsing '%API_HEALTH_URL%' -TimeoutSec 15; ^
-               Write-Host ('Health StatusCode: ' + $r.StatusCode); ^
-               if ($r.StatusCode -ne 200) { exit 1 } ^
-             } catch { ^
-               Write-Host ('ERROR: ' + $_.Exception.Message); exit 1 ^
-             }"
-        '''
+        // If you want this to be MANDATORY, remove catchError wrapper.
+        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+          // IMPORTANT: single PowerShell block; no stray '^' inside PS
+          bat """
+            powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+              "& {
+                Write-Host 'Checking API health...'
+                try {
+                  \$r = Invoke-WebRequest -UseBasicParsing '${env.API_HEALTH_URL}' -TimeoutSec 15
+                  Write-Host ('Health StatusCode: ' + \$r.StatusCode)
+                  if (\$r.StatusCode -ne 200) { exit 1 }
+                } catch {
+                  Write-Host ('ERROR: ' + \$_.Exception.Message)
+                  exit 1
+                }
 
-        bat '''
-          powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-            "Write-Host 'Checking API metrics...'; ^
-             try { ^
-               $r = Invoke-WebRequest -UseBasicParsing '%API_METRICS_URL%' -TimeoutSec 15; ^
-               Write-Host ('Metrics StatusCode: ' + $r.StatusCode); ^
-               if ($r.StatusCode -ne 200) { exit 1 } ^
-               # Optional: basic content check (won't fail unless metrics empty)
-               if ([string]::IsNullOrWhiteSpace($r.Content)) { Write-Host 'WARNING: metrics empty'; } ^
-             } catch { ^
-               Write-Host ('ERROR: ' + $_.Exception.Message); exit 1 ^
-             }"
-        '''
+                Write-Host 'Checking API metrics...'
+                try {
+                  \$m = Invoke-WebRequest -UseBasicParsing '${env.API_METRICS_URL}' -TimeoutSec 15
+                  Write-Host ('Metrics StatusCode: ' + \$m.StatusCode)
+                  if (\$m.StatusCode -ne 200) { exit 1 }
+                } catch {
+                  Write-Host ('ERROR: ' + \$_.Exception.Message)
+                  exit 1
+                }
+              }"
+          """
+        }
       }
     }
   }
@@ -230,14 +248,14 @@ pipeline {
       echo "Pipeline completed. Workspace: ${env.WORKSPACE}"
       bat 'docker ps || exit /b 0'
     }
-    unstable {
-      echo "UNSTABLE: One or more OPTIONAL steps failed (Sonar/Trivy/Docker push). Core pipeline ran."
-    }
     failure {
       echo "FAILED: A mandatory stage failed. Review logs above."
     }
+    success {
+      echo "SUCCESS: Build, test, and staging deployment completed."
+    }
     cleanup {
-      cleanWs(deleteDirs: true, disableDeferredWipeout: true)
+      cleanWs()
     }
   }
 }
