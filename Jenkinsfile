@@ -4,22 +4,48 @@ pipeline {
   options {
     timestamps()
     ansiColor('xterm')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
   }
 
   parameters {
-    string(name: 'DOCKERHUB_NAMESPACE', defaultValue: 'rogen7spark', description: 'DockerHub namespace / username')
-    string(name: 'IMAGE_TAG', defaultValue: '', description: 'Optional tag (blank = BUILD_NUMBER)')
+    // DockerHub
+    string(name: 'DOCKERHUB_NAMESPACE', defaultValue: 'rogen7spark', description: 'DockerHub namespace/user (e.g., rogen7spark)')
     booleanParam(name: 'PUSH_TO_DOCKERHUB', defaultValue: true, description: 'Push images to DockerHub')
-    booleanParam(name: 'RUN_SONAR', defaultValue: false, description: 'Run SonarQube stage (requires Jenkins Sonar config)')
-    booleanParam(name: 'RUN_TRIVY', defaultValue: false, description: 'Run Trivy image scan (requires Trivy installed on agent)')
+    string(name: 'DOCKERHUB_CREDS_ID', defaultValue: 'dockerhub-creds', description: 'Jenkins Credentials ID for DockerHub username/password')
+
+    // Sonar (OPTIONAL)
+    booleanParam(name: 'RUN_SONAR', defaultValue: true, description: 'Run Sonar analysis (optional)')
+    string(name: 'SONAR_SERVER_NAME', defaultValue: 'SonarCloud', description: 'Name of SonarQube server in Jenkins: Manage Jenkins → Configure System → SonarQube servers')
+    string(name: 'SONAR_TOKEN_CRED_ID', defaultValue: 'sonar-token', description: 'Jenkins credential ID (Secret text) for Sonar token')
+    string(name: 'SONAR_PROJECT_KEY', defaultValue: 'chrisrogenirwinroland-cyber_keyshield-vault', description: 'SonarCloud project key')
+    string(name: 'SONAR_ORG', defaultValue: 'chrisrogenirwinroland-cyber', description: 'SonarCloud organization (if applicable)')
+
+    // Security scans (OPTIONAL)
+    booleanParam(name: 'RUN_NPM_AUDIT', defaultValue: true, description: 'Run npm audit (optional)')
+    booleanParam(name: 'RUN_TRIVY', defaultValue: false, description: 'Run Trivy image scan (optional; requires Trivy installed)')
+
+    // Deploy / health checks
+    string(name: 'COMPOSE_PROJECT', defaultValue: 'keyshield-staging', description: 'docker compose project name')
+    string(name: 'FRONTEND_URL', defaultValue: 'http://localhost:4200/', description: 'Frontend URL for synthetic check')
+    string(name: 'API_URL', defaultValue: 'http://localhost:3000/health', description: 'API health URL for synthetic check (update if different)')
+    string(name: 'API_CONTAINER', defaultValue: 'keyshield-api', description: 'API container name from docker ps')
+    string(name: 'FRONTEND_CONTAINER', defaultValue: 'keyshield-frontend', description: 'Frontend container name from docker ps')
+
+    // Tagging
+    string(name: 'IMAGE_TAG', defaultValue: '', description: 'Optional override tag. Leave blank to use BUILD_NUMBER.')
   }
 
   environment {
-    DOCKERHUB_CREDS_ID = 'dockerhub-creds'     // <-- you are using this
-    PROJECT_NAME       = 'keyshield-vault'
-    COMPOSE_PROJECT    = 'keyshield-staging'
-    API_PORT           = '3000'
-    WEB_PORT           = '4200'
+    // Auto-tag if user didn't supply one
+    BUILD_TAGGED = "${params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : env.BUILD_NUMBER}"
+
+    // Image names (DockerHub)
+    API_IMAGE  = "${params.DOCKERHUB_NAMESPACE}/keyshield-vault-api"
+    WEB_IMAGE  = "${params.DOCKERHUB_NAMESPACE}/keyshield-vault-web"
+
+    // Local compose file
+    COMPOSE_FILE = "docker-compose.yml"
   }
 
   stages {
@@ -37,76 +63,81 @@ pipeline {
         bat 'where docker'
         bat 'docker version'
         bat 'docker compose version'
-        bat 'where node   || exit /b 0'
-        bat 'node -v      || exit /b 0'
-        bat 'npm -v       || exit /b 0'
+        bat 'where node || exit /b 0'
+        bat 'node -v || exit /b 0'
+        bat 'npm -v  || exit /b 0'
       }
     }
 
     stage('Build (Docker Images)') {
       steps {
         script {
-          env.EFFECTIVE_TAG = (params.IMAGE_TAG?.trim())
-            ? params.IMAGE_TAG.trim()
-            : env.BUILD_NUMBER
+          echo "Building API image: ${env.API_IMAGE}:${env.BUILD_TAGGED}"
+          bat """
+            docker build ^
+              -t ${env.API_IMAGE}:${env.BUILD_TAGGED} ^
+              -t ${env.API_IMAGE}:latest ^
+              -f api\\Dockerfile api
+          """
 
-          env.API_IMAGE = "${params.DOCKERHUB_NAMESPACE}/${env.PROJECT_NAME}-api"
-          env.WEB_IMAGE = "${params.DOCKERHUB_NAMESPACE}/${env.PROJECT_NAME}-web"
+          echo "Building Frontend image: ${env.WEB_IMAGE}:${env.BUILD_TAGGED}"
+          bat """
+            docker build ^
+              -t ${env.WEB_IMAGE}:${env.BUILD_TAGGED} ^
+              -t ${env.WEB_IMAGE}:latest ^
+              -f frontend\\app\\Dockerfile frontend\\app
+          """
         }
-
-        echo "Building API image: ${env.API_IMAGE}:${env.EFFECTIVE_TAG}"
-        bat """
-          docker build ^
-            -t ${env.API_IMAGE}:${env.EFFECTIVE_TAG} ^
-            -t ${env.API_IMAGE}:latest ^
-            -f api\\Dockerfile api
-        """
-
-        echo "Building Frontend image: ${env.WEB_IMAGE}:${env.EFFECTIVE_TAG}"
-        bat """
-          docker build ^
-            -t ${env.WEB_IMAGE}:${env.EFFECTIVE_TAG} ^
-            -t ${env.WEB_IMAGE}:latest ^
-            -f frontend\\app\\Dockerfile frontend\\app
-        """
       }
     }
 
     stage('Test (API Unit Tests)') {
       steps {
         dir('api') {
-          // If you want unit tests to fail the pipeline, remove catchError and let it fail normally.
-          catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
-            bat 'npm ci'
-            bat 'npm test'
-          }
+          // Fail build if tests fail. If you want optional, wrap in catchError.
+          bat 'npm ci'
+          bat 'npm test'
         }
       }
     }
 
-    stage('Code Quality (SonarQube) - OPTIONAL') {
+    stage('Code Quality (Sonar) - OPTIONAL') {
       when { expression { return params.RUN_SONAR } }
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-          // IMPORTANT:
-          // The name below MUST match "Manage Jenkins > System > SonarQube servers > Name"
-          // Example: withSonarQubeEnv('SonarQube-Server-1') { ... }
-          withSonarQubeEnv('Sonar') {
-            // Requires sonar-scanner available on PATH or configured tool
-            // bat 'sonar-scanner -Dsonar.projectKey=... -Dsonar.sources=...'
-            echo "SonarQube stage enabled, but scanner command is currently placeholder."
+          script {
+            // Uses the Sonar server name you configured in Jenkins.
+            withSonarQubeEnv("${params.SONAR_SERVER_NAME}") {
+              withCredentials([string(credentialsId: "${params.SONAR_TOKEN_CRED_ID}", variable: 'SONAR_TOKEN')]) {
+
+                // If you have sonar-scanner installed in PATH, this will work directly.
+                // Otherwise install "SonarScanner" tool in Jenkins and call it via tool().
+                bat """
+                  echo Running Sonar analysis...
+                  sonar-scanner ^
+                    -Dsonar.host.url=%SONAR_HOST_URL% ^
+                    -Dsonar.login=%SONAR_TOKEN% ^
+                    -Dsonar.projectKey=${params.SONAR_PROJECT_KEY} ^
+                    -Dsonar.organization=${params.SONAR_ORG} ^
+                    -Dsonar.sources=api,frontend ^
+                    -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/coverage/** ^
+                    -Dsonar.javascript.lcov.reportPaths=api/coverage/lcov.info,frontend/app/coverage/lcov.info
+                """
+              }
+            }
           }
         }
       }
     }
 
     stage('Security (Dependency Audit) - OPTIONAL') {
+      when { expression { return params.RUN_NPM_AUDIT } }
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
           dir('api') {
             bat 'npm audit --audit-level=high || exit /b 0'
           }
-          dir('frontend\\app') {
+          dir('frontend/app') {
             bat 'npm audit --audit-level=high || exit /b 0'
           }
         }
@@ -118,9 +149,8 @@ pipeline {
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
           bat 'where trivy 1>nul 2>nul || (echo Trivy not installed. Skipping. & exit /b 0)'
-
-          bat "trivy image --severity HIGH,CRITICAL --no-progress ${env.API_IMAGE}:${env.EFFECTIVE_TAG} || exit /b 0"
-          bat "trivy image --severity HIGH,CRITICAL --no-progress ${env.WEB_IMAGE}:${env.EFFECTIVE_TAG} || exit /b 0"
+          bat "trivy image --severity HIGH,CRITICAL --no-progress ${env.API_IMAGE}:${env.BUILD_TAGGED} || exit /b 0"
+          bat "trivy image --severity HIGH,CRITICAL --no-progress ${env.WEB_IMAGE}:${env.BUILD_TAGGED} || exit /b 0"
         }
       }
     }
@@ -129,21 +159,15 @@ pipeline {
       when { expression { return params.PUSH_TO_DOCKERHUB } }
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-          withCredentials([usernamePassword(
-            credentialsId: env.DOCKERHUB_CREDS_ID,
-            usernameVariable: 'DH_USER',
-            passwordVariable: 'DH_PASS'
-          )]) {
+          withCredentials([usernamePassword(credentialsId: "${params.DOCKERHUB_CREDS_ID}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
             bat 'echo DockerHub user (from creds): %DH_USER%'
-            bat 'echo DockerHub namespace (param): ' + params.DOCKERHUB_NAMESPACE
-
-            bat 'echo Logging in to DockerHub...'
+            bat "echo DockerHub namespace (param): ${params.DOCKERHUB_NAMESPACE}"
             bat 'docker logout || exit /b 0'
             bat 'echo %DH_PASS% | docker login -u %DH_USER% --password-stdin'
 
-            bat "docker push ${env.API_IMAGE}:${env.EFFECTIVE_TAG}"
+            bat "docker push ${env.API_IMAGE}:${env.BUILD_TAGGED}"
             bat "docker push ${env.API_IMAGE}:latest"
-            bat "docker push ${env.WEB_IMAGE}:${env.EFFECTIVE_TAG}"
+            bat "docker push ${env.WEB_IMAGE}:${env.BUILD_TAGGED}"
             bat "docker push ${env.WEB_IMAGE}:latest"
 
             bat 'docker logout || exit /b 0'
@@ -155,25 +179,41 @@ pipeline {
     stage('Deploy (Staging)') {
       steps {
         bat 'echo Starting staging deployment...'
-        bat "docker compose -p ${env.COMPOSE_PROJECT} -f docker-compose.yml up -d --build"
+        // Use --build if you want local images rebuilt; otherwise omit.
+        bat "docker compose -p ${params.COMPOSE_PROJECT} -f ${env.COMPOSE_FILE} up -d --build"
+        bat 'docker ps'
       }
     }
 
     stage('Continuous Monitoring Validation') {
       steps {
-        // FIXED: run the entire try/catch inside ONE PowerShell invocation (no stray CMD "try")
-        bat """
-          powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-          "Write-Host 'Checking API health...'; ^
-           try { ^
-             \\$r = Invoke-WebRequest -UseBasicParsing 'http://localhost:${env.API_PORT}/health' -TimeoutSec 15; ^
-             Write-Host ('Health StatusCode: ' + \\$r.StatusCode); ^
-             if (\\$r.StatusCode -ne 200) { exit 1 } ^
-           } catch { ^
-             Write-Host ('ERROR: ' + \\$_.Exception.Message); ^
-             exit 1 ^
-           }"
-        """
+        script {
+          // Wait a bit for containers to stabilize
+          powershell 'Start-Sleep -Seconds 10'
+
+          // Validate containers exist and are running
+          def apiStatus = bat(script: "docker inspect -f \"{{.State.Status}}\" ${params.API_CONTAINER}", returnStdout: true).trim()
+          def apiRestarts = bat(script: "docker inspect -f \"{{.RestartCount}}\" ${params.API_CONTAINER}", returnStdout: true).trim()
+
+          echo "API container status: ${apiStatus} (restartCount=${apiRestarts})"
+
+          if (apiStatus != 'running') {
+            bat "docker logs ${params.API_CONTAINER} --tail 200"
+            error("Monitoring failed: API container is not running (status=${apiStatus}).")
+          }
+
+          // Synthetic HTTP checks
+          powershell """
+            \$ErrorActionPreference = 'Stop'
+            Write-Host 'Checking Frontend URL: ${params.FRONTEND_URL}'
+            Invoke-WebRequest '${params.FRONTEND_URL}' -UseBasicParsing -TimeoutSec 10 | Out-Null
+
+            Write-Host 'Checking API URL: ${params.API_URL}'
+            Invoke-WebRequest '${params.API_URL}' -UseBasicParsing -TimeoutSec 10 | Out-Null
+
+            Write-Host 'Continuous Monitoring Validation PASSED'
+          """
+        }
       }
     }
   }
@@ -182,10 +222,12 @@ pipeline {
     always {
       echo "Pipeline completed. Workspace: ${env.WORKSPACE}"
       bat 'docker ps || exit /b 0'
-      cleanWs()
     }
     failure {
-      echo 'FAILED: A mandatory stage failed. Review logs above.'
+      echo "FAILED: A mandatory stage failed. Review logs above."
+    }
+    cleanup {
+      cleanWs()
     }
   }
 }
