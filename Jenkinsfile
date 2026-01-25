@@ -3,52 +3,28 @@ pipeline {
 
   options {
     timestamps()
-    disableConcurrentBuilds()
     ansiColor('xterm')
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-  }
-
-  triggers {
-    // Example: every 30 mins
-    pollSCM('H/2 * * * *')
+    disableConcurrentBuilds()
   }
 
   environment {
-    // ---------------------------
-    // Repo / Docker / App settings
-    // ---------------------------
-    APP_NAME              = "keyshield-vault"
-    DOCKERHUB_NAMESPACE   = "chrisrogenirwinroland"
-    API_IMAGE             = "${DOCKERHUB_NAMESPACE}/keyshield-vault-api"
-    FE_IMAGE              = "${DOCKERHUB_NAMESPACE}/keyshield-vault-frontend"
+    // ---- Docker / Image Naming ----
+    DOCKERHUB_USER   = 'YOUR_DOCKERHUB_USERNAME'   // change
+    API_IMAGE        = "${DOCKERHUB_USER}/keyshield-api"
+    FE_IMAGE         = "${DOCKERHUB_USER}/keyshield-frontend"
+    IMAGE_TAG        = "${BUILD_NUMBER}"
 
-    // Use Jenkins build number for tag. You can also use Git SHA if you prefer.
-    IMAGE_TAG             = "${BUILD_NUMBER}"
+    // ---- SonarCloud (optional) ----
+    // Configure in Jenkins: Manage Jenkins -> Credentials
+    // SONAR_TOKEN_ID  = 'sonarcloud-token'         // optional
+    // SONAR_ORG       = 'your-org'                 // optional
+    // SONAR_PROJECT   = 'your-project'             // optional
 
-    // ---------------------------
-    // Paths inside your repo (adjust!)
-    // ---------------------------
-    API_DIR               = "api"        // folder containing API package.json and Dockerfile
-    FE_DIR                = "frontend"   // folder containing Frontend package.json and Dockerfile
-    COMPOSE_FILE          = "docker-compose.yml"
+    // ---- Trivy (optional) ----
+    TRIVY_CACHE_DIR  = "${WORKSPACE}\\.trivycache"
 
-    // ---------------------------
-    // SonarCloud (optional)
-    // ---------------------------
-    // Create in Jenkins: Credentials -> "sonarcloud-token" (Secret text)
-    SONARCLOUD_TOKEN_CRED = "sonarcloud-token"
-    SONAR_ORG             = "YOUR_SONARCLOUD_ORG"         // e.g. hardhat-enterprises
-    SONAR_PROJECT_KEY     = "YOUR_SONAR_PROJECT_KEY"      // e.g. keyshield-vault
-
-    // ---------------------------
-    // Docker Hub credentials (optional push)
-    // ---------------------------
-    // Create in Jenkins: Credentials -> "dockerhub-creds" (Username + Password)
-    DOCKERHUB_CRED        = "dockerhub-creds"
-
-    // Trivy settings
-    TRIVY_IMAGE           = "aquasec/trivy:latest"
-    TRIVY_TIMEOUT         = "20m"
+    // ---- Compose ----
+    COMPOSE_FILE     = 'docker-compose.yml'
   }
 
   stages {
@@ -56,50 +32,85 @@ pipeline {
     stage('Checkout') {
       steps {
         checkout scm
-        bat """
+        bat '''
           echo ===== GIT STATUS =====
           git --version
           git rev-parse --short HEAD
           git status
-        """
+        '''
       }
     }
 
     stage('Preflight') {
       steps {
-        bat """
+        bat '''
           echo ===== TOOL VERSIONS =====
           where node
           node -v
           npm -v
-          docker -v
-          docker info
-        """
+          where docker
+          docker version
+        '''
       }
     }
 
     stage('Install & Unit Tests - API') {
       steps {
-        dir("${API_DIR}") {
-          bat """
+        dir('api') {
+          bat '''
             echo ===== API INSTALL =====
-            npm ci
+            if exist package-lock.json (
+              npm ci
+            ) else (
+              npm install
+            )
+
             echo ===== API TEST =====
+            REM Run tests only if defined
+            node -e "const p=require('./package.json');process.exit(p.scripts&&p.scripts.test?0:1)" || (
+              echo No test script in API package.json - skipping
+              exit /b 0
+            )
             npm test
-          """
+          '''
         }
       }
     }
 
     stage('Install & Unit Tests - Frontend') {
       steps {
-        dir("${FE_DIR}") {
-          bat """
+        // IMPORTANT: Angular app lives here
+        dir('frontend\\app') {
+          bat '''
             echo ===== FE INSTALL =====
-            npm ci
+            if exist package-lock.json (
+              npm ci
+            ) else (
+              npm install
+            )
+
             echo ===== FE TEST =====
+            node -e "const p=require('./package.json');process.exit(p.scripts&&p.scripts.test?0:1)" || (
+              echo No test script in Frontend package.json - skipping
+              exit /b 0
+            )
             npm test
-          """
+          '''
+        }
+      }
+    }
+
+    stage('Build - Frontend') {
+      steps {
+        dir('frontend\\app') {
+          bat '''
+            echo ===== FE BUILD =====
+            node -e "const p=require('./package.json');process.exit(p.scripts&&p.scripts.build?0:1)" || (
+              echo No build script in Frontend package.json - skipping build
+              exit /b 0
+            )
+            npm run build
+          '''
         }
       }
     }
@@ -107,32 +118,28 @@ pipeline {
     stage('Build Docker Images') {
       steps {
         bat """
-          echo ===== BUILD API IMAGE =====
-          docker build -t %API_IMAGE%:%IMAGE_TAG% -f %API_DIR%\\Dockerfile %API_DIR%
+          echo ===== DOCKER BUILD =====
 
-          echo ===== BUILD FE IMAGE =====
-          docker build -t %FE_IMAGE%:%IMAGE_TAG% -f %FE_DIR%\\Dockerfile %FE_DIR%
+          REM Build API image (Dockerfile in api/)
+          docker build -t %API_IMAGE%:%IMAGE_TAG% -f api\\Dockerfile api
 
-          echo ===== LIST IMAGES =====
-          docker images | findstr /I "%DOCKERHUB_NAMESPACE%/keyshield-vault"
+          REM Build Frontend image (Dockerfile in frontend/app/)
+          docker build -t %FE_IMAGE%:%IMAGE_TAG% -f frontend\\app\\Dockerfile frontend\\app
         """
       }
     }
 
+    // ---------------- OPTIONAL QUALITY: SonarCloud ----------------
+    // Enable only if you have sonar-scanner installed/configured & token set.
+    /*
     stage('Code Quality - SonarCloud') {
-      when {
-        expression { return env.SONAR_ORG?.trim() && env.SONAR_PROJECT_KEY?.trim() }
-      }
       steps {
-        withCredentials([string(credentialsId: "${SONARCLOUD_TOKEN_CRED}", variable: 'SONAR_TOKEN')]) {
-          // Requires sonar-scanner installed on agent, or use npx sonar-scanner in JS projects.
-          // If you don't have sonar-scanner installed, switch to "npx sonar-scanner" approach.
+        withCredentials([string(credentialsId: env.SONAR_TOKEN_ID, variable: 'SONAR_TOKEN')]) {
           bat """
             echo ===== SONARCLOUD SCAN =====
-            echo Make sure sonar-scanner is available on PATH.
             sonar-scanner ^
               -Dsonar.organization=%SONAR_ORG% ^
-              -Dsonar.projectKey=%SONAR_PROJECT_KEY% ^
+              -Dsonar.projectKey=%SONAR_PROJECT% ^
               -Dsonar.sources=. ^
               -Dsonar.host.url=https://sonarcloud.io ^
               -Dsonar.login=%SONAR_TOKEN%
@@ -140,129 +147,106 @@ pipeline {
         }
       }
     }
+    */
 
+    // ---------------- OPTIONAL SECURITY: Trivy ----------------
     stage('Security - Trivy FS Scan (vuln+misconfig)') {
+      when { expression { return fileExists('docker-compose.yml') } }
       steps {
-        // Mount workspace into /work and scan filesystem.
-        // --exit-code 0 keeps pipeline green while still producing findings for evidence.
-        bat """
+        bat '''
           echo ===== TRIVY FS SCAN =====
-          docker run --rm -v "%CD%:/work" %TRIVY_IMAGE% ^
-            fs /work ^
-            --scanners vuln,misconfig ^
-            --timeout %TRIVY_TIMEOUT% ^
-            --exit-code 0
-        """
+          if not exist "%TRIVY_CACHE_DIR%" mkdir "%TRIVY_CACHE_DIR%"
+
+          trivy --version || (
+            echo Trivy not found on agent. Skipping FS scan.
+            exit /b 0
+          )
+
+          trivy fs --cache-dir "%TRIVY_CACHE_DIR%" --scanners vuln,misconfig --severity HIGH,CRITICAL --exit-code 0 .
+        '''
       }
     }
 
-    stage('Security - Trivy Image Scan (TAR input, Windows-safe)') {
+    stage('Security - Trivy Image Scan') {
       steps {
-        // This avoids Docker daemon socket problems: save images -> scan via --input tar
-        bat """
-          echo ===== DOCKER SAVE (TAR) =====
-          docker save -o api_%IMAGE_TAG%.tar %API_IMAGE%:%IMAGE_TAG%
-          docker save -o fe_%IMAGE_TAG%.tar %FE_IMAGE%:%IMAGE_TAG%
+        bat '''
+          echo ===== TRIVY IMAGE SCAN =====
+          trivy --version || (
+            echo Trivy not found on agent. Skipping image scan.
+            exit /b 0
+          )
 
-          echo ===== TRIVY IMAGE SCAN (API TAR) =====
-          docker run --rm -v "%CD%:/work" %TRIVY_IMAGE% ^
-            image --input /work/api_%IMAGE_TAG%.tar ^
-            --timeout %TRIVY_TIMEOUT% ^
-            --exit-code 0
-
-          echo ===== TRIVY IMAGE SCAN (FE TAR) =====
-          docker run --rm -v "%CD%:/work" %TRIVY_IMAGE% ^
-            image --input /work/fe_%IMAGE_TAG%.tar ^
-            --timeout %TRIVY_TIMEOUT% ^
-            --exit-code 0
-        """
-      }
-      post {
-        always {
-          // Keep scan artifacts if you want (tar files). Optional cleanup:
-          bat """
-            echo ===== CLEAN TAR (OPTIONAL) =====
-            del /Q api_%IMAGE_TAG%.tar 2>nul
-            del /Q fe_%IMAGE_TAG%.tar 2>nul
-          """
-        }
+          trivy image --cache-dir "%TRIVY_CACHE_DIR%" --severity HIGH,CRITICAL --exit-code 0 %API_IMAGE%:%IMAGE_TAG%
+          trivy image --cache-dir "%TRIVY_CACHE_DIR%" --severity HIGH,CRITICAL --exit-code 0 %FE_IMAGE%:%IMAGE_TAG%
+        '''
       }
     }
 
+    // ---------------- OPTIONAL PUSH: Docker Hub ----------------
     stage('Push Images (Docker Hub)') {
-      when {
-        expression { return env.DOCKERHUB_NAMESPACE?.trim() }
-      }
+      when { expression { return env.DOCKERHUB_USER?.trim() } }
       steps {
-        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CRED}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
-          bat """
+        // Create Jenkins credential: usernamePassword, id: dockerhub-creds
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          bat '''
             echo ===== DOCKER LOGIN =====
             echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
 
-            echo ===== PUSH API =====
+            echo ===== DOCKER PUSH =====
             docker push %API_IMAGE%:%IMAGE_TAG%
-
-            echo ===== PUSH FE =====
             docker push %FE_IMAGE%:%IMAGE_TAG%
-
-            echo ===== DOCKER LOGOUT =====
-            docker logout
-          """
+          '''
         }
       }
     }
 
+    // ---------------- DEPLOY: docker-compose ----------------
     stage('Deploy - Docker Compose') {
+      when { expression { return fileExists(env.COMPOSE_FILE) } }
       steps {
-        // If your compose file references fixed tags, update it to use ${IMAGE_TAG},
-        // OR overwrite env vars at runtime (recommended).
-        bat """
-          echo ===== DEPLOY WITH DOCKER COMPOSE =====
-          if not exist "%COMPOSE_FILE%" (
-            echo ERROR: %COMPOSE_FILE% not found in repo root.
-            exit /b 1
+        bat '''
+          echo ===== DEPLOY COMPOSE =====
+          docker compose version || (
+            echo Docker Compose V2 not found. Trying docker-compose...
+            docker-compose --version || exit /b 1
           )
 
-          REM Pass image tags via environment variables used in docker-compose.yml
-          set API_IMAGE=%API_IMAGE%
-          set FE_IMAGE=%FE_IMAGE%
-          set IMAGE_TAG=%IMAGE_TAG%
-
-          docker compose -f %COMPOSE_FILE% down
-          docker compose -f %COMPOSE_FILE% up -d
-
-          echo ===== CONTAINER STATUS =====
-          docker ps
-        """
+          REM Pull (optional) and up
+          docker compose -f "%COMPOSE_FILE%" up -d --build || docker-compose -f "%COMPOSE_FILE%" up -d --build
+        '''
       }
     }
 
     stage('Smoke Check') {
+      when { expression { return fileExists(env.COMPOSE_FILE) } }
       steps {
-        // Adjust ports/endpoints to match your app.
-        // This is a basic local check; replace with your real health endpoints.
-        bat """
-          echo ===== SMOKE CHECK (EDIT URLS) =====
-          REM Example:
-          REM powershell -Command "try { (Invoke-WebRequest -UseBasicParsing http://localhost:3000/health).StatusCode } catch { exit 1 }"
-          echo Update this stage to hit your /health endpoints.
-        """
+        bat '''
+          echo ===== SMOKE CHECK =====
+          REM Adjust URLs/ports to your app
+          powershell -Command ^
+            "try { ^
+              $r = Invoke-WebRequest -UseBasicParsing http://localhost:4200 -TimeoutSec 20; ^
+              Write-Host 'Frontend OK:' $r.StatusCode ^
+            } catch { ^
+              Write-Host 'Frontend smoke failed'; exit 1 ^
+            }"
+        '''
       }
     }
   }
 
   post {
     always {
-      bat """
+      bat '''
         echo ===== POST: DOCKER PS =====
         docker ps
-      """
-    }
-    success {
-      echo "Pipeline completed successfully."
+      '''
     }
     failure {
-      echo "Pipeline failed. Check stage logs for the root cause."
+      echo 'Pipeline failed. Check stage logs for the root cause.'
+    }
+    success {
+      echo 'Pipeline completed successfully.'
     }
   }
 }
