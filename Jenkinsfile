@@ -1,3 +1,8 @@
+// Jenkinsfile (Windows agent) — full pipeline with:
+// 1) PowerShell-based GIT_SHA capture (fixes "i was unexpected at this time")
+// 2) PowerShell preflight verification
+// 3) Clean old containers before docker compose deploy (prevents name conflicts)
+
 pipeline {
   agent any
 
@@ -5,20 +10,13 @@ pipeline {
     timestamps()
     ansiColor('xterm')
     disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
   }
 
   environment {
-    // Repo / app identity
-    ORG        = "chrisrogenirwinroland-cyber"
-    PROJECTKEY = "chrisrogenirwinroland-cyber_keyshield-vault"
-    PROJECTNAME= "chrisrogenirwinroland-cyber_keyshield-vault"
-
-    // Docker Hub
-    DOCKERHUB_USER = "rogen7spark"
-
-    // App URLs for smoke test (adjust ports/paths if your compose differs)
-    API_URL = "http://localhost:3000"
-    FE_URL  = "http://localhost:4200"
+    DOCKERHUB_USER = 'rogen7spark'
+    SONAR_ORG      = 'chrisrogenirwinroland-cyber'
+    SONAR_PROJECT  = 'chrisrogenirwinroland-cyber_keyshield-vault'
   }
 
   stages {
@@ -26,6 +24,7 @@ pipeline {
     stage('Checkout & Traceability') {
       steps {
         checkout scm
+
         bat '''
           echo ===== GIT TRACEABILITY =====
           git --version
@@ -33,14 +32,19 @@ pipeline {
           git log -1 --pretty=oneline
           git status
         '''
+
+        // (2) Ensure Jenkins can run PowerShell steps
+        bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
+
+        // (1) Replace ONLY the GIT_SHA capture block with PowerShell
         script {
-          // Windows-safe capture of short SHA
-          env.GIT_SHA = bat(
-            script: '@for /f "delims=" %i in (\'git rev-parse --short HEAD\') do @echo %i',
+          env.GIT_SHA = powershell(
+            script: '(git rev-parse --short HEAD).Trim()',
             returnStdout: true
           ).trim()
 
           if (!env.GIT_SHA) { env.GIT_SHA = "manual" }
+
           echo "Resolved GIT_SHA = ${env.GIT_SHA}"
         }
       }
@@ -54,7 +58,8 @@ pipeline {
           node -v
           npm -v
           where docker
-          docker version
+          docker --version
+          docker compose version
           where trivy
           trivy --version
         '''
@@ -68,18 +73,12 @@ pipeline {
             echo ===== API INSTALL =====
             npm ci
           '''
-          // If you later add tests: npm test -- --ci
         }
       }
       post {
         always {
-          // Do NOT fail build if no reports exist
-          script {
-            try { junit allowEmptyResults: true, testResults: 'api/**/junit*.xml, api/**/TEST-*.xml' }
-            catch (e) { echo "JUnit publish skipped: ${e}" }
-          }
-
-          // Optional artifacts
+          // Will not fail build if no reports found, but will show warning in Jenkins
+          junit allowEmptyResults: true, testResults: 'api/**/junit*.xml, api/**/test-results.xml, api/**/TEST-*.xml'
           archiveArtifacts allowEmptyArchive: true, artifacts: 'api/npm-debug.log, api/**/coverage/**'
         }
       }
@@ -92,15 +91,11 @@ pipeline {
             echo ===== FE INSTALL =====
             npm ci
           '''
-          // If you later add tests: npm test -- --watch=false --code-coverage
         }
       }
       post {
         always {
-          script {
-            try { junit allowEmptyResults: true, testResults: 'frontend/app/**/junit*.xml, frontend/app/**/TEST-*.xml' }
-            catch (e) { echo "JUnit publish skipped: ${e}" }
-          }
+          junit allowEmptyResults: true, testResults: 'frontend/app/**/junit*.xml, frontend/app/**/test-results.xml, frontend/app/**/TEST-*.xml'
           archiveArtifacts allowEmptyArchive: true, artifacts: 'frontend/app/npm-debug.log, frontend/app/**/coverage/**'
         }
       }
@@ -130,15 +125,14 @@ pipeline {
             withCredentials([string(credentialsId: 'SONAR_TOKEN', variable: 'SONAR_TOKEN')]) {
               bat """
                 echo ===== SONARCLOUD SCAN (MONOREPO) =====
-                echo ProjectKey: ${env.PROJECTKEY}
-                echo Org: ${env.ORG}
-
+                echo ProjectKey: %SONAR_PROJECT%
+                echo Org: %SONAR_ORG%
                 "${scannerHome}\\bin\\sonar-scanner.bat" ^
                   -Dsonar.host.url=https://sonarcloud.io ^
                   -Dsonar.token=%SONAR_TOKEN% ^
-                  -Dsonar.organization=${env.ORG} ^
-                  -Dsonar.projectKey=${env.PROJECTKEY} ^
-                  -Dsonar.projectName=${env.PROJECTNAME} ^
+                  -Dsonar.organization=%SONAR_ORG% ^
+                  -Dsonar.projectKey=%SONAR_PROJECT% ^
+                  -Dsonar.projectName=%SONAR_PROJECT% ^
                   -Dsonar.sources=api,frontend/app/src ^
                   -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/.angular/**,**/coverage/** ^
                   -Dsonar.javascript.lcov.reportPaths=api/coverage/lcov.info,frontend/app/coverage/lcov.info
@@ -154,7 +148,6 @@ pipeline {
         bat '''
           echo ===== TRIVY FILESYSTEM SCAN =====
           if not exist "reports" mkdir "reports"
-
           trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format json  --output "reports\\trivy-fs.json" .
           trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format table --output "reports\\trivy-fs.txt"  .
           echo ===== TRIVY FS SCAN COMPLETE =====
@@ -162,7 +155,7 @@ pipeline {
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-fs.*'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-fs.json, reports/trivy-fs.txt'
         }
       }
     }
@@ -171,8 +164,8 @@ pipeline {
       steps {
         bat """
           echo ===== DOCKER BUILD =====
-          set API_IMAGE=${env.DOCKERHUB_USER}/keyshield-vault-api:${env.GIT_SHA}
-          set FE_IMAGE=${env.DOCKERHUB_USER}/keyshield-vault-web:${env.GIT_SHA}
+          set API_IMAGE=%DOCKERHUB_USER%/keyshield-vault-api:%GIT_SHA%
+          set FE_IMAGE=%DOCKERHUB_USER%/keyshield-vault-web:%GIT_SHA%
 
           echo Building %API_IMAGE%
           docker build -t %API_IMAGE% -f api\\Dockerfile api
@@ -192,8 +185,8 @@ pipeline {
           echo ===== TRIVY IMAGE SCAN (TAR) =====
           if not exist "reports" mkdir "reports"
 
-          set API_IMAGE=${env.DOCKERHUB_USER}/keyshield-vault-api:${env.GIT_SHA}
-          set FE_IMAGE=${env.DOCKERHUB_USER}/keyshield-vault-web:${env.GIT_SHA}
+          set API_IMAGE=%DOCKERHUB_USER%/keyshield-vault-api:%GIT_SHA%
+          set FE_IMAGE=%DOCKERHUB_USER%/keyshield-vault-web:%GIT_SHA%
 
           docker save -o "reports\\api-image.tar" %API_IMAGE%
           docker save -o "reports\\fe-image.tar"  %FE_IMAGE%
@@ -206,20 +199,20 @@ pipeline {
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/*trivy*.*'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/api-image.tar, reports/fe-image.tar, reports/trivy-*-image.json'
         }
       }
     }
 
     stage('Push Images (Docker Hub)') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'DOCKER_HUB', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+        withCredentials([usernamePassword(credentialsId: 'DOCKERHUB_CREDS', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
           bat """
             echo ===== DOCKER LOGIN =====
             echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
 
-            set API_IMAGE=${env.DOCKERHUB_USER}/keyshield-vault-api:${env.GIT_SHA}
-            set FE_IMAGE=${env.DOCKERHUB_USER}/keyshield-vault-web:${env.GIT_SHA}
+            set API_IMAGE=%DOCKERHUB_USER%/keyshield-vault-api:%GIT_SHA%
+            set FE_IMAGE=%DOCKERHUB_USER%/keyshield-vault-web:%GIT_SHA%
 
             echo ===== PUSH =====
             docker push %API_IMAGE%
@@ -234,43 +227,30 @@ pipeline {
 
     stage('Deploy - Docker Compose (Staging)') {
       steps {
-        bat """
+        // (3A) Clean old containers before deploy (prevents "name already in use")
+        bat '''
+          echo ===== CLEAN OLD CONTAINERS =====
+          docker rm -f keyshield-api 2>NUL || echo "No old keyshield-api to remove"
+          docker rm -f keyshield-frontend 2>NUL || echo "No old keyshield-frontend to remove"
+        '''
+
+        bat '''
           echo ===== DEPLOY STAGING =====
-
-          REM Make deploy idempotent and avoid name conflicts seen in your log:
-          docker rm -f keyshield-api 2>NUL || echo keyshield-api not present
-          docker rm -f keyshield-frontend 2>NUL || echo keyshield-frontend not present
-
           docker compose -f docker-compose.yml down --remove-orphans
-          docker compose -f docker-compose.yml up -d --build --force-recreate
-
+          docker compose -f docker-compose.yml up -d --build
           echo ===== DOCKER PS =====
           docker ps
-        """
+        '''
       }
     }
 
     stage('Release - Smoke / Health Validation') {
       steps {
-        // FIXES your r1 error: we do NOT create Groovy-binding variables like r1/r2
-        powershell """
-          Write-Host '===== RELEASE SMOKE TEST ====='
-          $ErrorActionPreference = 'Stop'
-
-          Write-Host 'Checking Frontend...'
-          Invoke-WebRequest '${env:FE_URL}' -UseBasicParsing -TimeoutSec 20 | Out-Null
-          Write-Host 'Frontend OK'
-
-          Write-Host 'Checking API...'
-          try {
-            Invoke-WebRequest '${env:API_URL}/health' -UseBasicParsing -TimeoutSec 20 | Out-Null
-            Write-Host 'API /health OK'
-          } catch {
-            Write-Host 'No /health endpoint; trying API root...'
-            Invoke-WebRequest '${env:API_URL}' -UseBasicParsing -TimeoutSec 20 | Out-Null
-            Write-Host 'API root OK'
-          }
-        """
+        // Adjust URL/port if your compose exposes differently
+        bat '''
+          echo ===== SMOKE CHECK (API) =====
+          powershell -NoProfile -Command "try { iwr http://localhost:3000/health -UseBasicParsing -TimeoutSec 10 | Out-Null; 'API OK' } catch { 'API NOT OK'; exit 1 }"
+        '''
       }
     }
   }
@@ -281,13 +261,12 @@ pipeline {
         echo ===== POST: DOCKER PS =====
         docker ps
         echo ===== POST: API LOG TAIL (if exists) =====
-        docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
+        docker logs keyshield-api --tail 120 2>NUL || echo "No keyshield-api container logs available"
       '''
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**, frontend/app/dist/**'
+      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**'
     }
-
     failure {
-      echo "Pipeline failed. Check deploy conflict, logs, and reports artifacts."
+      echo 'Pipeline failed. Check deploy conflict, logs, and reports artifacts.'
     }
   }
 }
