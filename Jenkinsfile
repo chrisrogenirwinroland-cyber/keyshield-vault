@@ -1,3 +1,22 @@
+// Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, Docker, Email alerts)
+//
+// Repo layout (your confirmed structure):
+//  - api/package.json, api/package-lock.json, api/Dockerfile
+//  - frontend/app/package.json, frontend/app/package-lock.json, frontend/app/Dockerfile
+//  - docker-compose.yml at repo root
+//
+// Jenkins requirements (already in your setup):
+//  - SonarQube Scanner tool configured in Jenkins as: "SonarQubeScanner"
+//  - SonarCloud server configured in Jenkins as: "SonarCloud"
+//  - Credentials:
+//      * sonar-token (Secret text)  -> SonarCloud token
+//      * dockerhub-creds (Username/Password) -> DockerHub
+//  - Email Extension Plugin configured (SMTP) + Admin email
+//
+// IMPORTANT: Trivy must be visible to Jenkins service PATH.
+// If pipeline says "trivy not recognized", restart Jenkins service OR set PATH+TRIVY in Jenkins global env to:
+//   C:\ProgramData\chocolatey\bin
+//
 pipeline {
   agent any
 
@@ -6,36 +25,34 @@ pipeline {
     ansiColor('xterm')
     disableConcurrentBuilds()
     buildDiscarder(logRotator(numToKeepStr: '15'))
+    skipDefaultCheckout(true)
   }
 
   environment {
-    // ========= Repo / Traceability =========
-    APP_NAME = "keyshield-vault"
-    // IMPORTANT: use env.GIT_SHA everywhere (not plain GIT_SHA)
-    GIT_SHA  = "unknown"
+    // ========= App / traceability =========
+    APP_NAME  = "keyshield-vault"
+    GIT_SHA   = "unknown"
 
     // ========= Docker Hub =========
     DOCKERHUB_NAMESPACE = "rogen7spark"
     DOCKERHUB_CREDS_ID  = "dockerhub-creds"
 
     // ========= SonarCloud =========
-    // Jenkins: Manage Jenkins -> System -> SonarQube servers -> Name = SonarCloud
-    SONAR_SERVER_NAME   = "SonarCloud"
-    // Jenkins: Manage Jenkins -> Credentials -> ID = sonar-token (Secret text)
-    SONAR_TOKEN_ID      = "sonar-token"
-    // From your SonarCloud URL: https://sonarcloud.io/project/overview?id=...
-    SONAR_ORG           = "chrisrogenirwinroland-cyber"
-    SONAR_PROJECT_KEY   = "chrisrogenirwinroland-cyber_keyshield-vault"
+    SONAR_SERVER_NAME = "SonarCloud"
+    SONAR_SCANNER_TOOL = "SonarQubeScanner"     // Manage Jenkins -> Tools -> SonarQube Scanner name
+    SONAR_TOKEN_ID   = "sonar-token"
+    SONAR_ORG        = "chrisrogenirwinroland-cyber"
+    SONAR_PROJECT_KEY= "chrisrogenirwinroland-cyber_keyshield-vault"
 
-    // Jenkins: Manage Jenkins -> Tools -> SonarQube Scanner -> Name MUST match
-    SONAR_SCANNER_TOOL  = "SonarQubeScanner"
-
-    // ========= Email / Alerts =========
+    // ========= Email =========
     ALERT_TO = "s225493677@deakin.edu.au"
 
-    // ========= Local staging URLs =========
+    // ========= Release / smoke =========
     FE_URL  = "http://localhost:4200"
     API_URL = "http://localhost:3000"
+
+    // ========= Reports =========
+    REPORT_DIR = "reports"
   }
 
   stages {
@@ -51,9 +68,9 @@ pipeline {
           git status
         """
         script {
-          env.GIT_SHA = bat(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-          if (!env.GIT_SHA) { env.GIT_SHA = "unknown" }
-          echo "Resolved env.GIT_SHA = ${env.GIT_SHA}"
+          def sha = bat(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+          env.GIT_SHA = sha ?: "unknown"
+          echo "Resolved GIT_SHA = ${env.GIT_SHA}"
         }
       }
     }
@@ -65,12 +82,14 @@ pipeline {
           where node
           node -v
           npm -v
+
+          echo ===== DOCKER =====
           where docker
           docker version
+
+          echo ===== TRIVY =====
           where trivy
           trivy --version
-          where git
-          git --version
         """
       }
     }
@@ -81,6 +100,7 @@ pipeline {
           bat """
             echo ===== API INSTALL =====
             npm ci
+
             echo ===== API TEST =====
             npm test
           """
@@ -88,7 +108,9 @@ pipeline {
       }
       post {
         always {
-          junit allowEmptyResults: true, testResults: 'api/**/junit*.xml'
+          // Prevent “No test report files were found” noise by allowing empty.
+          // If you later output JUnit XML, Jenkins will display it automatically.
+          junit allowEmptyResults: true, testResults: 'api/**/junit*.xml, api/**/TEST-*.xml'
           archiveArtifacts allowEmptyArchive: true, artifacts: 'api/npm-debug.log, api/**/coverage/**'
         }
       }
@@ -96,11 +118,11 @@ pipeline {
 
     stage('Install & Unit Tests - Frontend') {
       steps {
-        // REQUIRED: FE stages must run inside frontend/app
         dir('frontend/app') {
           bat """
             echo ===== FE INSTALL =====
             npm ci
+
             echo ===== FE TEST =====
             npm test
           """
@@ -108,7 +130,7 @@ pipeline {
       }
       post {
         always {
-          junit allowEmptyResults: true, testResults: 'frontend/app/**/junit*.xml'
+          junit allowEmptyResults: true, testResults: 'frontend/app/**/junit*.xml, frontend/app/**/TEST-*.xml'
           archiveArtifacts allowEmptyArchive: true, artifacts: 'frontend/app/npm-debug.log, frontend/app/**/coverage/**'
         }
       }
@@ -133,17 +155,19 @@ pipeline {
     stage('Code Quality - SonarCloud') {
       steps {
         script {
-          // Uses Jenkins Tool installation (fixes: 'sonar-scanner' not recognized)
+          // Ensure sonar scanner tool is installed via Jenkins Tools
           def scannerHome = tool("${SONAR_SCANNER_TOOL}")
+
           withSonarQubeEnv("${SONAR_SERVER_NAME}") {
             withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
               bat """
                 echo ===== SONARCLOUD SCAN (MONOREPO) =====
                 echo ProjectKey: %SONAR_PROJECT_KEY%
                 echo Org: %SONAR_ORG%
+
                 "${scannerHome}\\bin\\sonar-scanner.bat" ^
                   -Dsonar.host.url=https://sonarcloud.io ^
-                  -Dsonar.login=%SONAR_TOKEN% ^
+                  -Dsonar.token=%SONAR_TOKEN% ^
                   -Dsonar.organization=%SONAR_ORG% ^
                   -Dsonar.projectKey=%SONAR_PROJECT_KEY% ^
                   -Dsonar.projectName=%SONAR_PROJECT_KEY% ^
@@ -161,9 +185,12 @@ pipeline {
       steps {
         bat """
           echo ===== TRIVY FILESYSTEM SCAN =====
-          if not exist reports mkdir reports
-          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format json --output reports\\trivy-fs.json .
-          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format table --output reports\\trivy-fs.txt .
+          if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
+
+          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format json  --output "%REPORT_DIR%\\trivy-fs.json" .
+          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format table --output "%REPORT_DIR%\\trivy-fs.txt"  .
+
+          echo ===== TRIVY FS SCAN COMPLETE =====
         """
       }
       post {
@@ -186,7 +213,7 @@ pipeline {
           echo Building %FE_IMAGE%
           docker build -t %FE_IMAGE% -f frontend\\app\\Dockerfile frontend\\app
 
-          echo ===== DOCKER IMAGES =====
+          echo ===== DOCKER IMAGES (filtered) =====
           docker images | findstr %APP_NAME%
         """
       }
@@ -195,22 +222,24 @@ pipeline {
     stage('Security - Trivy Image Scan (TAR input, Windows-safe)') {
       steps {
         bat """
-          echo ===== TRIVY IMAGE SCAN =====
-          if not exist reports mkdir reports
+          echo ===== TRIVY IMAGE SCAN (TAR) =====
+          if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
 
           set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
           set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
 
-          docker save -o reports\\api-image.tar %API_IMAGE%
-          docker save -o reports\\fe-image.tar %FE_IMAGE%
+          docker save -o "%REPORT_DIR%\\api-image.tar" %API_IMAGE%
+          docker save -o "%REPORT_DIR%\\fe-image.tar"  %FE_IMAGE%
 
-          trivy image --input reports\\api-image.tar --severity HIGH,CRITICAL --format json --output reports\\trivy-api-image.json
-          trivy image --input reports\\fe-image.tar  --severity HIGH,CRITICAL --format json --output reports\\trivy-fe-image.json
+          trivy image --input "%REPORT_DIR%\\api-image.tar" --severity HIGH,CRITICAL --format json --output "%REPORT_DIR%\\trivy-api-image.json"
+          trivy image --input "%REPORT_DIR%\\fe-image.tar"  --severity HIGH,CRITICAL --format json --output "%REPORT_DIR%\\trivy-fe-image.json"
+
+          echo ===== TRIVY IMAGE SCAN COMPLETE =====
         """
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports\\trivy-*-image.json, reports\\*.tar'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-api-image.json, reports/trivy-fe-image.json, reports/*.tar'
         }
       }
     }
@@ -242,6 +271,7 @@ pipeline {
           echo ===== DEPLOY STAGING =====
           docker compose -f docker-compose.yml down
           docker compose -f docker-compose.yml up -d --build
+          echo ===== DOCKER PS =====
           docker ps
         """
       }
@@ -254,22 +284,22 @@ pipeline {
 
           # Frontend
           try {
-            \$r1 = Invoke-WebRequest '${env:FE_URL}' -UseBasicParsing -TimeoutSec 20
-            Write-Host ('FE Status: ' + \$r1.StatusCode)
+            $r1 = Invoke-WebRequest '${env:FE_URL}' -UseBasicParsing -TimeoutSec 20
+            Write-Host ('FE Status: ' + $r1.StatusCode)
           } catch {
             Write-Error 'Frontend smoke test failed'
             throw
           }
 
-          # API (fallback: root if /health not present)
+          # API - prefer /health but fallback to root
           try {
-            \$healthUrl = '${env:API_URL}/health'
-            \$r2 = Invoke-WebRequest \$healthUrl -UseBasicParsing -TimeoutSec 20
-            Write-Host ('API Health Status: ' + \$r2.StatusCode)
+            $healthUrl = '${env:API_URL}/health'
+            $r2 = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 20
+            Write-Host ('API /health Status: ' + $r2.StatusCode)
           } catch {
             Write-Host 'No /health endpoint or it failed; trying API root...'
-            \$r3 = Invoke-WebRequest '${env:API_URL}' -UseBasicParsing -TimeoutSec 20
-            Write-Host ('API Root Status: ' + \$r3.StatusCode)
+            $r3 = Invoke-WebRequest '${env:API_URL}' -UseBasicParsing -TimeoutSec 20
+            Write-Host ('API Root Status: ' + $r3.StatusCode)
           }
         """
       }
@@ -281,38 +311,42 @@ pipeline {
       bat """
         echo ===== POST: DOCKER PS =====
         docker ps
+
+        echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
+        docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
       """
+
       archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
     }
 
     success {
       emailext(
-        to: "${env.ALERT_TO}",
-        subject: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.GIT_SHA})",
+        to: "${ALERT_TO}",
+        subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
         body: """Build SUCCESS.
 
-Job: ${env.JOB_NAME}
-Build: #${env.BUILD_NUMBER}
-Commit: ${env.GIT_SHA}
-URL: ${env.BUILD_URL}
+Job: ${JOB_NAME}
+Build: #${BUILD_NUMBER}
+Commit: ${GIT_SHA}
+URL: ${BUILD_URL}
 
-Artifacts: Trivy reports + logs are archived in Jenkins.
+Artifacts: SonarCloud results + Trivy reports + build logs are archived in Jenkins.
 """
       )
     }
 
     failure {
       emailext(
-        to: "${env.ALERT_TO}",
-        subject: "FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.GIT_SHA})",
+        to: "${ALERT_TO}",
+        subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
         body: """Build FAILED.
 
-Job: ${env.JOB_NAME}
-Build: #${env.BUILD_NUMBER}
-Commit: ${env.GIT_SHA}
-URL: ${env.BUILD_URL}
+Job: ${JOB_NAME}
+Build: #${BUILD_NUMBER}
+Commit: ${GIT_SHA}
+URL: ${BUILD_URL}
 
-Check stage logs for root cause. Artifacts (if generated) are archived.
+Check stage logs for root cause. Trivy reports (if generated) are archived.
 """,
         attachLog: true
       )
