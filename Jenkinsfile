@@ -10,25 +10,32 @@ pipeline {
 
   environment {
     // ========= Repo / Traceability =========
-    APP_NAME          = "keyshield-vault"
-    GIT_SHA           = ""   // set in Checkout stage
+    APP_NAME = "keyshield-vault"
+    // IMPORTANT: use env.GIT_SHA everywhere (not plain GIT_SHA)
+    GIT_SHA  = "unknown"
 
     // ========= Docker Hub =========
     DOCKERHUB_NAMESPACE = "rogen7spark"
     DOCKERHUB_CREDS_ID  = "dockerhub-creds"
 
     // ========= SonarCloud =========
-    SONAR_SERVER_NAME   = "SonarCloud" 
+    // Jenkins: Manage Jenkins -> System -> SonarQube servers -> Name = SonarCloud
+    SONAR_SERVER_NAME   = "SonarCloud"
+    // Jenkins: Manage Jenkins -> Credentials -> ID = sonar-token (Secret text)
     SONAR_TOKEN_ID      = "sonar-token"
+    // From your SonarCloud URL: https://sonarcloud.io/project/overview?id=...
     SONAR_ORG           = "chrisrogenirwinroland-cyber"
     SONAR_PROJECT_KEY   = "chrisrogenirwinroland-cyber_keyshield-vault"
 
+    // Jenkins: Manage Jenkins -> Tools -> SonarQube Scanner -> Name MUST match
+    SONAR_SCANNER_TOOL  = "SonarQubeScanner"
+
     // ========= Email / Alerts =========
-    ALERT_TO            = "s225493677@deakin.edu.au"
+    ALERT_TO = "s225493677@deakin.edu.au"
 
     // ========= Local staging URLs =========
-    FE_URL              = "http://localhost:4200"
-    API_URL             = "http://localhost:3000"
+    FE_URL  = "http://localhost:4200"
+    API_URL = "http://localhost:3000"
   }
 
   stages {
@@ -45,7 +52,8 @@ pipeline {
         """
         script {
           env.GIT_SHA = bat(script: "git rev-parse --short HEAD", returnStdout: true).trim()
-          echo "Resolved GIT_SHA = ${env.GIT_SHA}"
+          if (!env.GIT_SHA) { env.GIT_SHA = "unknown" }
+          echo "Resolved env.GIT_SHA = ${env.GIT_SHA}"
         }
       }
     }
@@ -61,6 +69,8 @@ pipeline {
           docker version
           where trivy
           trivy --version
+          where git
+          git --version
         """
       }
     }
@@ -78,7 +88,6 @@ pipeline {
       }
       post {
         always {
-          // If you later output JUnit XML, Jenkins will show it automatically.
           junit allowEmptyResults: true, testResults: 'api/**/junit*.xml'
           archiveArtifacts allowEmptyArchive: true, artifacts: 'api/npm-debug.log, api/**/coverage/**'
         }
@@ -87,6 +96,7 @@ pipeline {
 
     stage('Install & Unit Tests - Frontend') {
       steps {
+        // REQUIRED: FE stages must run inside frontend/app
         dir('frontend/app') {
           bat """
             echo ===== FE INSTALL =====
@@ -122,23 +132,26 @@ pipeline {
 
     stage('Code Quality - SonarCloud') {
       steps {
-        withSonarQubeEnv("${SONAR_SERVER_NAME}") {
-          // Using token stored in Jenkins credentials
-          withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
-            bat """
-              echo ===== SONARCLOUD SCAN (MONOREPO) =====
-              echo ProjectKey: %SONAR_PROJECT_KEY%
-              echo Org: %SONAR_ORG%
-              sonar-scanner ^
-                -Dsonar.host.url=https://sonarcloud.io ^
-                -Dsonar.login=%SONAR_TOKEN% ^
-                -Dsonar.organization=%SONAR_ORG% ^
-                -Dsonar.projectKey=%SONAR_PROJECT_KEY% ^
-                -Dsonar.projectName=%SONAR_PROJECT_KEY% ^
-                -Dsonar.sources=api,frontend/app/src ^
-                -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/.angular/**,**/coverage/** ^
-                -Dsonar.javascript.lcov.reportPaths=api/coverage/lcov.info,frontend/app/coverage/lcov.info
-            """
+        script {
+          // Uses Jenkins Tool installation (fixes: 'sonar-scanner' not recognized)
+          def scannerHome = tool("${SONAR_SCANNER_TOOL}")
+          withSonarQubeEnv("${SONAR_SERVER_NAME}") {
+            withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
+              bat """
+                echo ===== SONARCLOUD SCAN (MONOREPO) =====
+                echo ProjectKey: %SONAR_PROJECT_KEY%
+                echo Org: %SONAR_ORG%
+                "${scannerHome}\\bin\\sonar-scanner.bat" ^
+                  -Dsonar.host.url=https://sonarcloud.io ^
+                  -Dsonar.login=%SONAR_TOKEN% ^
+                  -Dsonar.organization=%SONAR_ORG% ^
+                  -Dsonar.projectKey=%SONAR_PROJECT_KEY% ^
+                  -Dsonar.projectName=%SONAR_PROJECT_KEY% ^
+                  -Dsonar.sources=api,frontend/app/src ^
+                  -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/.angular/**,**/coverage/** ^
+                  -Dsonar.javascript.lcov.reportPaths=api/coverage/lcov.info,frontend/app/coverage/lcov.info
+              """
+            }
           }
         }
       }
@@ -197,7 +210,7 @@ pipeline {
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-*-image.json, reports/*.tar'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports\\trivy-*-image.json, reports\\*.tar'
         }
       }
     }
@@ -269,19 +282,19 @@ pipeline {
         echo ===== POST: DOCKER PS =====
         docker ps
       """
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json'
+      archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
     }
 
     success {
       emailext(
-        to: "${ALERT_TO}",
-        subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+        to: "${env.ALERT_TO}",
+        subject: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.GIT_SHA})",
         body: """Build SUCCESS.
 
-Job: ${JOB_NAME}
-Build: #${BUILD_NUMBER}
-Commit: ${GIT_SHA}
-URL: ${BUILD_URL}
+Job: ${env.JOB_NAME}
+Build: #${env.BUILD_NUMBER}
+Commit: ${env.GIT_SHA}
+URL: ${env.BUILD_URL}
 
 Artifacts: Trivy reports + logs are archived in Jenkins.
 """
@@ -290,16 +303,16 @@ Artifacts: Trivy reports + logs are archived in Jenkins.
 
     failure {
       emailext(
-        to: "${ALERT_TO}",
-        subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+        to: "${env.ALERT_TO}",
+        subject: "FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.GIT_SHA})",
         body: """Build FAILED.
 
-Job: ${JOB_NAME}
-Build: #${BUILD_NUMBER}
-Commit: ${GIT_SHA}
-URL: ${BUILD_URL}
+Job: ${env.JOB_NAME}
+Build: #${env.BUILD_NUMBER}
+Commit: ${env.GIT_SHA}
+URL: ${env.BUILD_URL}
 
-Check stage logs for root cause. Trivy reports (if generated) are archived.
+Check stage logs for root cause. Artifacts (if generated) are archived.
 """,
         attachLog: true
       )
