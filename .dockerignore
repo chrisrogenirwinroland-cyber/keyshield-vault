@@ -1,0 +1,55 @@
+# -----------------------------
+# Repo-root Docker ignore
+# Applies to build context sent to Docker for any service that uses "."
+# -----------------------------
+
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Node / frontend / backend
+**/node_modules
+**/npm-debug.log
+**/yarn-error.log
+**/pnpm-debug.log
+**/.npm
+**/.yarn
+**/.pnpm-store
+
+# Build outputs
+**/dist
+**/build
+**/.angular
+**/.next
+**/.nuxt
+**/out
+**/coverage
+
+# Logs / temp
+**/*.log
+**/.cache
+**/.tmp
+**/tmp
+
+# OS/editor junk
+**/.DS_Store
+**/Thumbs.db
+**/.idea
+**/.vscode
+
+# Security & secrets (do NOT send to build context)
+**/.env
+**/*.pem
+**/*.key
+**/*.pfx
+**/*.crt
+**/*.cer
+
+# Reports/artifacts (you already generate these)
+reports
+**/*.tar
+**/*.zip
+
+# Jenkins workspace noise (optional safety)
+**/.jenkins

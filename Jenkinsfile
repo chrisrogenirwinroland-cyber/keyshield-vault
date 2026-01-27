@@ -24,8 +24,9 @@ pipeline {
 
     ALERT_TO = "s225493677@deakin.edu.au"
 
+    // ✅ IMPORTANT CHANGE: test via frontend reverse proxy (/api), not direct API port
     FE_URL  = "http://localhost:4200"
-    API_URL = "http://localhost:3000"
+    API_PROXY_BASE = "http://localhost:4200/api"
 
     REPORT_DIR = "reports"
   }
@@ -44,7 +45,6 @@ pipeline {
           git status
         """
 
-        // ✅ FIX: get commit SHA using cmd (bat), not powershell (PATH differences)
         script {
           def sha = bat(
             returnStdout: true,
@@ -227,11 +227,12 @@ pipeline {
 
     stage('Deploy - Docker Compose (Staging)') {
       steps {
+        // ✅ Make deploy deterministic: down first, then up
         bat """
+          docker compose -f docker-compose.yml down --remove-orphans || echo "compose down skipped"
           docker rm -f keyshield-api 2>NUL || echo "No old keyshield-api to remove"
           docker rm -f keyshield-frontend 2>NUL || echo "No old keyshield-frontend to remove"
 
-          docker compose -f docker-compose.yml down --remove-orphans
           docker compose -f docker-compose.yml up -d --build
 
           docker ps
@@ -239,47 +240,75 @@ pipeline {
       }
     }
 
-    stage('Release - Smoke / Health Validation') {
+    // ✅ UPDATED: end-to-end smoke test through frontend reverse proxy
+    stage('Release - E2E Smoke Test (UI Proxy Paths)') {
       steps {
-        // ✅ FIX: triple single quotes prevents Groovy from trying to resolve r1/r2
         powershell(script: '''
-          Write-Host "===== RELEASE SMOKE TEST ====="
+          Write-Host "===== E2E SMOKE TEST via NGINX /api ====="
           docker ps
 
-          # If API is restarting, capture logs early
-          try {
-            $restartCount = (docker inspect -f "{{.RestartCount}}" keyshield-api) -as [int]
-            $status       = (docker inspect -f "{{.State.Status}}" keyshield-api)
-            Write-Host ("API Status: " + $status + " | RestartCount: " + $restartCount)
-
-            if ($status -ne "running" -or $restartCount -gt 0) {
-              Write-Host "API looks unstable. Showing last logs:"
-              docker logs keyshield-api --tail 120
-            }
-          } catch {
-            Write-Host "Could not inspect API container (maybe not created yet)."
-          }
-
-          # Frontend
           $fe = $env:FE_URL
+          $api = $env:API_PROXY_BASE
+
+          # 1) FE route
           try {
-            $r1 = Invoke-WebRequest $fe -UseBasicParsing -TimeoutSec 20
-            Write-Host ("FE Status: " + $r1.StatusCode)
+            $rFe = Invoke-WebRequest ($fe + "/admin") -UseBasicParsing -TimeoutSec 20
+            Write-Host ("FE /admin Status: " + $rFe.StatusCode)
           } catch {
-            Write-Error "Frontend smoke test failed"
+            Write-Error "Frontend /admin failed"
             throw
           }
 
-          # API /health (fallback to root)
-          $apiHealth = ($env:API_URL + "/health")
+          # 2) API health via proxy
           try {
-            $r2 = Invoke-WebRequest $apiHealth -UseBasicParsing -TimeoutSec 20
-            Write-Host ("API /health Status: " + $r2.StatusCode)
+            $rHealth = Invoke-RestMethod -Method Get -Uri ($api + "/health") -TimeoutSec 20
+            Write-Host ("API /health ok: " + ($rHealth.status))
           } catch {
-            Write-Host "No /health endpoint or it failed; trying API root..."
-            $r3 = Invoke-WebRequest $env:API_URL -UseBasicParsing -TimeoutSec 20
-            Write-Host ("API Root Status: " + $r3.StatusCode)
+            Write-Error "API /health via proxy failed"
+            throw
           }
+
+          # 3) Login via proxy (known good creds)
+          $loginBody = @{ username="admin"; password="admin123" } | ConvertTo-Json
+          try {
+            $login = Invoke-RestMethod -Method Post -Uri ($api + "/auth/login") -ContentType "application/json" -Body $loginBody -TimeoutSec 20
+          } catch {
+            Write-Error "Login via proxy failed"
+            throw
+          }
+
+          if (-not $login.token) { throw "No token returned from /auth/login" }
+          $token = $login.token
+          Write-Host ("Got JWT token length=" + $token.Length)
+
+          # 4) Create API key via proxy (admin)
+          $keyBody = @{ label=("jenkins-key-" + $env:BUILD_NUMBER) } | ConvertTo-Json
+          try {
+            $newKey = Invoke-RestMethod -Method Post -Uri ($api + "/admin/keys") `
+              -Headers @{ Authorization = ("Bearer " + $token) } `
+              -ContentType "application/json" -Body $keyBody -TimeoutSec 20
+          } catch {
+            Write-Error "Create key via proxy failed"
+            throw
+          }
+
+          if (-not $newKey.raw_key_once) { throw "No raw_key_once returned from /admin/keys" }
+          $apiKey = $newKey.raw_key_once
+          Write-Host ("Got raw_key_once length=" + $apiKey.Length + " last4=" + $newKey.key_last4)
+
+          # 5) Client access via proxy (x-api-key)
+          try {
+            $client = Invoke-RestMethod -Method Post -Uri ($api + "/client/access") `
+              -Headers @{ "x-api-key" = $apiKey } -TimeoutSec 20
+          } catch {
+            Write-Error "Client access via proxy failed"
+            throw
+          }
+
+          Write-Host ("Client access=" + $client.access)
+          if ($client.access -ne "granted") { throw "Expected access=granted but got: $($client.access)" }
+
+          Write-Host "✅ E2E smoke test passed (login->createKey->clientAccess via /api proxy)."
         ''')
       }
     }

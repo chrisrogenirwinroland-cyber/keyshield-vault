@@ -2,7 +2,7 @@ import { Injectable } from '@angular/core';
 
 @Injectable({ providedIn: 'root' })
 export class ApiService {
-  baseUrl = 'http://localhost:3000';
+  baseUrl = (window as any).__env?.API_BASE_URL || '/api';
   token: string | null = localStorage.getItem('token');
 
   setToken(t: string) {

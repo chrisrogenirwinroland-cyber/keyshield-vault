@@ -1,0 +1,12 @@
+@"
+services:
+  api:
+    image: YOUR_DOCKERHUB_USER/keyshield-api:${IMAGE_TAG}
+    ports:
+      - "3100:3000"
+
+  frontend:
+    image: YOUR_DOCKERHUB_USER/keyshield-frontend:${IMAGE_TAG}
+    ports:
+      - "4300:80"
+"@ | Set-Content -Encoding utf8 ".\docker-compose.prod.yml"
