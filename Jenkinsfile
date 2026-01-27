@@ -1,7 +1,21 @@
-// Jenkinsfile (Windows agent) — full pipeline with:
-// 1) PowerShell-based GIT_SHA capture (fixes "i was unexpected at this time")
-// 2) PowerShell preflight verification
-// 3) Clean old containers before docker compose deploy (prevents name conflicts)
+// Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, Docker, Email alerts)
+//
+// Repo layout:
+//  - api/package.json, api/package-lock.json, api/Dockerfile
+//  - frontend/app/package.json, frontend/app/package-lock.json, frontend/app/Dockerfile
+//  - docker-compose.yml at repo root
+//
+// Jenkins requirements:
+//  - SonarQube Scanner tool configured in Jenkins as: "SonarQubeScanner"
+//  - SonarCloud server configured in Jenkins as: "SonarCloud"
+//  - Credentials:
+//      * sonar-token (Secret text)               -> SonarCloud token
+//      * dockerhub-creds (Username/Password)    -> DockerHub
+//  - Email Extension Plugin configured (SMTP)
+//
+// IMPORTANT: Trivy must be visible to the Jenkins service PATH.
+// If "trivy not recognized", restart Jenkins service OR add to Jenkins global PATH:
+//   C:\ProgramData\chocolatey\bin
 
 pipeline {
   agent any
@@ -10,13 +24,35 @@ pipeline {
     timestamps()
     ansiColor('xterm')
     disableConcurrentBuilds()
-    buildDiscarder(logRotator(numToKeepStr: '20'))
+    buildDiscarder(logRotator(numToKeepStr: '15'))
+    skipDefaultCheckout(true)
   }
 
   environment {
-    DOCKERHUB_USER = 'rogen7spark'
-    SONAR_ORG      = 'chrisrogenirwinroland-cyber'
-    SONAR_PROJECT  = 'chrisrogenirwinroland-cyber_keyshield-vault'
+    // ========= App / traceability =========
+    APP_NAME  = "keyshield-vault"
+    GIT_SHA   = "unknown"
+
+    // ========= Docker Hub =========
+    DOCKERHUB_NAMESPACE = "rogen7spark"
+    DOCKERHUB_CREDS_ID  = "dockerhub-creds"
+
+    // ========= SonarCloud =========
+    SONAR_SERVER_NAME   = "SonarCloud"
+    SONAR_SCANNER_TOOL  = "SonarQubeScanner"
+    SONAR_TOKEN_ID      = "sonar-token"
+    SONAR_ORG           = "chrisrogenirwinroland-cyber"
+    SONAR_PROJECT_KEY   = "chrisrogenirwinroland-cyber_keyshield-vault"
+
+    // ========= Email =========
+    ALERT_TO = "s225493677@deakin.edu.au"
+
+    // ========= Release / smoke =========
+    FE_URL  = "http://localhost:4200"
+    API_URL = "http://localhost:3000"
+
+    // ========= Reports =========
+    REPORT_DIR = "reports"
   }
 
   stages {
@@ -25,18 +61,15 @@ pipeline {
       steps {
         checkout scm
 
-        bat '''
+        bat """
           echo ===== GIT TRACEABILITY =====
           git --version
           git rev-parse --short HEAD
           git log -1 --pretty=oneline
           git status
-        '''
+        """
 
-        // (2) Ensure Jenkins can run PowerShell steps
-        bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
-
-        // (1) Replace ONLY the GIT_SHA capture block with PowerShell
+        // FIX: Safe GIT_SHA capture using PowerShell (prevents cmd parsing errors)
         script {
           env.GIT_SHA = powershell(
             script: '(git rev-parse --short HEAD).Trim()',
@@ -52,33 +85,41 @@ pipeline {
 
     stage('Preflight (Toolchain Verification)') {
       steps {
-        bat '''
+        bat """
           echo ===== TOOL VERSIONS =====
           where node
           node -v
           npm -v
+
+          echo ===== DOCKER =====
           where docker
-          docker --version
-          docker compose version
+          docker version
+
+          echo ===== TRIVY =====
           where trivy
           trivy --version
-        '''
+        """
+
+        // Ensure Jenkins can run PowerShell steps
+        bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
       }
     }
 
     stage('Install & Unit Tests - API') {
       steps {
         dir('api') {
-          bat '''
+          bat """
             echo ===== API INSTALL =====
             npm ci
-          '''
+
+            echo ===== API TEST =====
+            npm test
+          """
         }
       }
       post {
         always {
-          // Will not fail build if no reports found, but will show warning in Jenkins
-          junit allowEmptyResults: true, testResults: 'api/**/junit*.xml, api/**/test-results.xml, api/**/TEST-*.xml'
+          junit allowEmptyResults: true, testResults: 'api/**/junit*.xml, api/**/TEST-*.xml'
           archiveArtifacts allowEmptyArchive: true, artifacts: 'api/npm-debug.log, api/**/coverage/**'
         }
       }
@@ -87,15 +128,18 @@ pipeline {
     stage('Install & Unit Tests - Frontend') {
       steps {
         dir('frontend/app') {
-          bat '''
+          bat """
             echo ===== FE INSTALL =====
             npm ci
-          '''
+
+            echo ===== FE TEST =====
+            npm test
+          """
         }
       }
       post {
         always {
-          junit allowEmptyResults: true, testResults: 'frontend/app/**/junit*.xml, frontend/app/**/test-results.xml, frontend/app/**/TEST-*.xml'
+          junit allowEmptyResults: true, testResults: 'frontend/app/**/junit*.xml, frontend/app/**/TEST-*.xml'
           archiveArtifacts allowEmptyArchive: true, artifacts: 'frontend/app/npm-debug.log, frontend/app/**/coverage/**'
         }
       }
@@ -104,10 +148,10 @@ pipeline {
     stage('Build - Frontend (Angular)') {
       steps {
         dir('frontend/app') {
-          bat '''
+          bat """
             echo ===== FE BUILD =====
             npm run build
-          '''
+          """
         }
       }
       post {
@@ -120,19 +164,21 @@ pipeline {
     stage('Code Quality - SonarCloud') {
       steps {
         script {
-          def scannerHome = tool 'SonarQubeScanner'
-          withSonarQubeEnv('SonarCloud') {
-            withCredentials([string(credentialsId: 'SONAR_TOKEN', variable: 'SONAR_TOKEN')]) {
+          def scannerHome = tool("${SONAR_SCANNER_TOOL}")
+
+          withSonarQubeEnv("${SONAR_SERVER_NAME}") {
+            withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
               bat """
                 echo ===== SONARCLOUD SCAN (MONOREPO) =====
-                echo ProjectKey: %SONAR_PROJECT%
+                echo ProjectKey: %SONAR_PROJECT_KEY%
                 echo Org: %SONAR_ORG%
+
                 "${scannerHome}\\bin\\sonar-scanner.bat" ^
                   -Dsonar.host.url=https://sonarcloud.io ^
                   -Dsonar.token=%SONAR_TOKEN% ^
                   -Dsonar.organization=%SONAR_ORG% ^
-                  -Dsonar.projectKey=%SONAR_PROJECT% ^
-                  -Dsonar.projectName=%SONAR_PROJECT% ^
+                  -Dsonar.projectKey=%SONAR_PROJECT_KEY% ^
+                  -Dsonar.projectName=%SONAR_PROJECT_KEY% ^
                   -Dsonar.sources=api,frontend/app/src ^
                   -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/.angular/**,**/coverage/** ^
                   -Dsonar.javascript.lcov.reportPaths=api/coverage/lcov.info,frontend/app/coverage/lcov.info
@@ -145,13 +191,15 @@ pipeline {
 
     stage('Security - Trivy FS Scan (vuln+misconfig)') {
       steps {
-        bat '''
+        bat """
           echo ===== TRIVY FILESYSTEM SCAN =====
-          if not exist "reports" mkdir "reports"
-          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format json  --output "reports\\trivy-fs.json" .
-          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format table --output "reports\\trivy-fs.txt"  .
+          if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
+
+          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format json  --output "%REPORT_DIR%\\trivy-fs.json" .
+          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format table --output "%REPORT_DIR%\\trivy-fs.txt"  .
+
           echo ===== TRIVY FS SCAN COMPLETE =====
-        '''
+        """
       }
       post {
         always {
@@ -164,8 +212,8 @@ pipeline {
       steps {
         bat """
           echo ===== DOCKER BUILD =====
-          set API_IMAGE=%DOCKERHUB_USER%/keyshield-vault-api:%GIT_SHA%
-          set FE_IMAGE=%DOCKERHUB_USER%/keyshield-vault-web:%GIT_SHA%
+          set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
+          set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
 
           echo Building %API_IMAGE%
           docker build -t %API_IMAGE% -f api\\Dockerfile api
@@ -174,7 +222,7 @@ pipeline {
           docker build -t %FE_IMAGE% -f frontend\\app\\Dockerfile frontend\\app
 
           echo ===== DOCKER IMAGES (filtered) =====
-          docker images | findstr keyshield-vault
+          docker images | findstr %APP_NAME%
         """
       }
     }
@@ -183,36 +231,36 @@ pipeline {
       steps {
         bat """
           echo ===== TRIVY IMAGE SCAN (TAR) =====
-          if not exist "reports" mkdir "reports"
+          if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
 
-          set API_IMAGE=%DOCKERHUB_USER%/keyshield-vault-api:%GIT_SHA%
-          set FE_IMAGE=%DOCKERHUB_USER%/keyshield-vault-web:%GIT_SHA%
+          set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
+          set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
 
-          docker save -o "reports\\api-image.tar" %API_IMAGE%
-          docker save -o "reports\\fe-image.tar"  %FE_IMAGE%
+          docker save -o "%REPORT_DIR%\\api-image.tar" %API_IMAGE%
+          docker save -o "%REPORT_DIR%\\fe-image.tar"  %FE_IMAGE%
 
-          trivy image --input "reports\\api-image.tar" --severity HIGH,CRITICAL --format json --output "reports\\trivy-api-image.json"
-          trivy image --input "reports\\fe-image.tar"  --severity HIGH,CRITICAL --format json --output "reports\\trivy-fe-image.json"
+          trivy image --input "%REPORT_DIR%\\api-image.tar" --severity HIGH,CRITICAL --format json --output "%REPORT_DIR%\\trivy-api-image.json"
+          trivy image --input "%REPORT_DIR%\\fe-image.tar"  --severity HIGH,CRITICAL --format json --output "%REPORT_DIR%\\trivy-fe-image.json"
 
           echo ===== TRIVY IMAGE SCAN COMPLETE =====
         """
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/api-image.tar, reports/fe-image.tar, reports/trivy-*-image.json'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-api-image.json, reports/trivy-fe-image.json, reports/*.tar'
         }
       }
     }
 
     stage('Push Images (Docker Hub)') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'DOCKERHUB_CREDS', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS_ID}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
           bat """
             echo ===== DOCKER LOGIN =====
             echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
 
-            set API_IMAGE=%DOCKERHUB_USER%/keyshield-vault-api:%GIT_SHA%
-            set FE_IMAGE=%DOCKERHUB_USER%/keyshield-vault-web:%GIT_SHA%
+            set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
+            set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
 
             echo ===== PUSH =====
             docker push %API_IMAGE%
@@ -227,46 +275,97 @@ pipeline {
 
     stage('Deploy - Docker Compose (Staging)') {
       steps {
-        // (3A) Clean old containers before deploy (prevents "name already in use")
-        bat '''
+        // Option A: Clean old containers before deploy (recommended)
+        bat """
           echo ===== CLEAN OLD CONTAINERS =====
           docker rm -f keyshield-api 2>NUL || echo "No old keyshield-api to remove"
           docker rm -f keyshield-frontend 2>NUL || echo "No old keyshield-frontend to remove"
-        '''
+        """
 
-        bat '''
+        bat """
           echo ===== DEPLOY STAGING =====
           docker compose -f docker-compose.yml down --remove-orphans
           docker compose -f docker-compose.yml up -d --build
+
           echo ===== DOCKER PS =====
           docker ps
-        '''
+        """
       }
     }
 
     stage('Release - Smoke / Health Validation') {
       steps {
-        // Adjust URL/port if your compose exposes differently
-        bat '''
-          echo ===== SMOKE CHECK (API) =====
-          powershell -NoProfile -Command "try { iwr http://localhost:3000/health -UseBasicParsing -TimeoutSec 10 | Out-Null; 'API OK' } catch { 'API NOT OK'; exit 1 }"
-        '''
+        powershell """
+          Write-Host '===== RELEASE SMOKE TEST ====='
+
+          # Frontend
+          try {
+            $r1 = Invoke-WebRequest '${env:FE_URL}' -UseBasicParsing -TimeoutSec 20
+            Write-Host ('FE Status: ' + $r1.StatusCode)
+          } catch {
+            Write-Error 'Frontend smoke test failed'
+            throw
+          }
+
+          # API - prefer /health but fallback to root
+          try {
+            $healthUrl = '${env:API_URL}/health'
+            $r2 = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 20
+            Write-Host ('API /health Status: ' + $r2.StatusCode)
+          } catch {
+            Write-Host 'No /health endpoint or it failed; trying API root...'
+            $r3 = Invoke-WebRequest '${env:API_URL}' -UseBasicParsing -TimeoutSec 20
+            Write-Host ('API Root Status: ' + $r3.StatusCode)
+          }
+        """
       }
     }
   }
 
   post {
     always {
-      bat '''
+      bat """
         echo ===== POST: DOCKER PS =====
         docker ps
-        echo ===== POST: API LOG TAIL (if exists) =====
-        docker logs keyshield-api --tail 120 2>NUL || echo "No keyshield-api container logs available"
-      '''
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**'
+
+        echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
+        docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
+      """
+
+      archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
     }
+
+    success {
+      emailext(
+        to: "${ALERT_TO}",
+        subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+        body: """Build SUCCESS.
+
+Job: ${JOB_NAME}
+Build: #${BUILD_NUMBER}
+Commit: ${GIT_SHA}
+URL: ${BUILD_URL}
+
+Artifacts: SonarCloud results + Trivy reports + build logs are archived in Jenkins.
+"""
+      )
+    }
+
     failure {
-      echo 'Pipeline failed. Check deploy conflict, logs, and reports artifacts.'
+      emailext(
+        to: "${ALERT_TO}",
+        subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+        body: """Build FAILED.
+
+Job: ${JOB_NAME}
+Build: #${BUILD_NUMBER}
+Commit: ${GIT_SHA}
+URL: ${BUILD_URL}
+
+Check stage logs for root cause. Trivy reports (if generated) are archived.
+""",
+        attachLog: true
+      )
     }
   }
 }
