@@ -1,3 +1,7 @@
+// Jenkinsfile (Windows agent) - KeyShield Vault
+// Fixes: Git "dubious ownership" on Windows (Jenkins runs as SYSTEM)
+// Adds: Windows-safe cleanup, safe.directory before checkout, stronger smoke tests (/admin, /client, /api/health)
+
 pipeline {
   agent any
 
@@ -32,40 +36,54 @@ pipeline {
 
   stages {
 
-    stage('Checkout & Traceability') {
+    stage('Workspace Prep (Windows + Git Safe Directory)') {
       steps {
-        // Windows-safe cleanup (replaces deleteDir()) to avoid "file is being used" locks
+        // 1) Ensure Git trusts this workspace path (prevents "dubious ownership" during fetch)
+        // NOTE: This runs before checkout and does NOT require a repo to exist yet.
+        bat '''
+          echo ===== GIT SAFE.DIRECTORY PRE-CHECK =====
+          where git
+          git --version
+
+          echo Adding safe.directory for this workspace:
+          echo %WORKSPACE%
+          git config --global --add safe.directory "%WORKSPACE%" || exit /b 0
+        '''
+
+        // 2) Best-effort cleanup to avoid Windows lock errors
         bat '''
           echo ===== WORKSPACE CLEANUP (WINDOWS SAFE) =====
-
-          rem Kill common lock-holder processes (ignore failures)
           taskkill /F /IM node.exe /T 2>NUL
-          taskkill /F /IM npm.exe /T 2>NUL
-          taskkill /F /IM ng.exe /T 2>NUL
-          taskkill /F /IM docker.exe /T 2>NUL
+          taskkill /F /IM npm.exe  /T 2>NUL
+          taskkill /F /IM ng.exe   /T 2>NUL
 
           cd /d "%WORKSPACE%"
 
-          rem Best-effort delete all files in workspace
+          rem Best-effort delete files
           del /F /Q /S * 2>NUL
 
-          rem Best-effort delete all folders in workspace
-          for /D %%G in (*) do rmdir /S /Q "%%G" 2>NUL
+          rem Best-effort delete folders
+          for /d %%D in (*) do rmdir /S /Q "%%D" 2>NUL
 
           echo ===== CLEANUP DONE (BEST EFFORT) =====
           dir
         '''
+      }
+    }
 
+    stage('Checkout & Traceability') {
+      steps {
         checkout scm
 
-        bat """
+        bat '''
           echo ===== GIT TRACEABILITY =====
           git --version
           git rev-parse --short HEAD
           git log -1 --pretty=oneline
           git status
-        """
+        '''
 
+        // Resolve SHA in a Windows-stable way
         script {
           def sha = bat(
             returnStdout: true,
@@ -80,7 +98,7 @@ pipeline {
 
     stage('Preflight (Toolchain Verification)') {
       steps {
-        bat """
+        bat '''
           echo ===== TOOL VERSIONS =====
           where node
           node -v
@@ -93,7 +111,7 @@ pipeline {
           echo ===== TRIVY =====
           where trivy
           trivy --version
-        """
+        '''
         bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
       }
     }
@@ -101,13 +119,13 @@ pipeline {
     stage('Install & Unit Tests - API') {
       steps {
         dir('api') {
-          bat """
+          bat '''
             echo ===== API INSTALL =====
             npm ci
 
             echo ===== API TEST =====
             npm test
-          """
+          '''
         }
       }
       post {
@@ -121,13 +139,13 @@ pipeline {
     stage('Install & Unit Tests - Frontend') {
       steps {
         dir('frontend/app') {
-          bat """
+          bat '''
             echo ===== FE INSTALL =====
             npm ci
 
             echo ===== FE TEST =====
             npm test
-          """
+          '''
         }
       }
       post {
@@ -141,10 +159,10 @@ pipeline {
     stage('Build - Frontend (Angular)') {
       steps {
         dir('frontend/app') {
-          bat """
+          bat '''
             echo ===== FE BUILD =====
             npm run build
-          """
+          '''
         }
       }
       post {
@@ -162,6 +180,7 @@ pipeline {
           withSonarQubeEnv("${SONAR_SERVER_NAME}") {
             withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
               bat """
+                echo ===== SONARCLOUD SCAN =====
                 "${scannerHome}\\bin\\sonar-scanner.bat" ^
                   -Dsonar.host.url=https://sonarcloud.io ^
                   -Dsonar.token=%SONAR_TOKEN% ^
@@ -223,6 +242,7 @@ pipeline {
       }
       post {
         always {
+          // NOTE: tar files can be big; you can remove "*.tar" if you don’t want them archived.
           archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-api-image.json, reports/trivy-fe-image.json'
         }
       }
@@ -260,40 +280,34 @@ pipeline {
       }
     }
 
-    stage('Release - Smoke / Health Validation') {
+    stage('Release - Smoke / UI Proxy Validation') {
       steps {
         powershell(script: '''
           Write-Host "===== RELEASE SMOKE TEST ====="
           docker ps
 
-          # API state
-          try {
-            $restartCount = (docker inspect -f "{{.RestartCount}}" keyshield-api) -as [int]
-            $status       = (docker inspect -f "{{.State.Status}}" keyshield-api)
-            Write-Host ("API Status: " + $status + " | RestartCount: " + $restartCount)
-
-            if ($status -ne "running" -or $restartCount -gt 0) {
-              Write-Host "API looks unstable. Showing last logs:"
-              docker logs keyshield-api --tail 120
-            }
-          } catch {
-            Write-Host "Could not inspect API container (maybe not created yet)."
+          # Frontend routes (Angular should serve index.html via nginx try_files)
+          $fe = $env:FE_URL
+          foreach ($p in @("/", "/admin", "/client")) {
+            $u = ($fe.TrimEnd("/") + $p)
+            $r = Invoke-WebRequest $u -UseBasicParsing -TimeoutSec 20
+            Write-Host ("FE " + $p + " => " + $r.StatusCode)
+            if ($r.StatusCode -ne 200) { throw ("FE route failed: " + $p) }
           }
 
-          # Frontend root
-          $fe = $env:FE_URL
-          $r1 = Invoke-WebRequest $fe -UseBasicParsing -TimeoutSec 20
-          Write-Host ("FE Status: " + $r1.StatusCode)
+          # API health through FE proxy (must work)
+          $apiHealthProxy = ($fe.TrimEnd("/") + "/api/health")
+          $r2 = Invoke-WebRequest $apiHealthProxy -UseBasicParsing -TimeoutSec 20
+          Write-Host ("FE /api/health => " + $r2.StatusCode)
+          if ($r2.StatusCode -ne 200) { throw "/api/health proxy failed" }
 
-          # API /health (fallback to /api/health if needed)
-          $apiHealth = ($env:API_URL + "/health")
+          # Direct API health (optional)
+          $apiHealthDirect = ($env:API_URL.TrimEnd("/") + "/health")
           try {
-            $r2 = Invoke-WebRequest $apiHealth -UseBasicParsing -TimeoutSec 20
-            Write-Host ("API /health Status: " + $r2.StatusCode)
+            $r3 = Invoke-WebRequest $apiHealthDirect -UseBasicParsing -TimeoutSec 20
+            Write-Host ("API /health => " + $r3.StatusCode)
           } catch {
-            Write-Host "No /health endpoint; trying /api/health via FE proxy..."
-            $r3 = Invoke-WebRequest ($env:FE_URL + "/api/health") -UseBasicParsing -TimeoutSec 20
-            Write-Host ("FE /api/health Status: " + $r3.StatusCode)
+            Write-Host "API /health not available directly; ignoring."
           }
         ''')
       }
@@ -302,13 +316,13 @@ pipeline {
 
   post {
     always {
-      // IMPORTANT: Never fail post on missing container
-      bat """
+      // Never fail build from post actions
+      bat '''
         docker ps
-        docker logs keyshield-api --tail 120 2>NUL || echo No keyshield-api container logs available
+        docker logs keyshield-api --tail 120 2>NUL || echo "No keyshield-api container logs available"
         exit /b 0
-      """
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**'
+      '''
+      archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
     }
 
     success {
