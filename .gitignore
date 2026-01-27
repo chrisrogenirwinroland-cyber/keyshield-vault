@@ -2,3 +2,18 @@
 # Local runtime DB
 api/data.db
 
+# Sonar
+.scannerwork/
+
+# Reports / scan outputs / docker image exports
+reports/
+*.tar
+
+# Node / Angular
+**/node_modules/
+**/dist/
+**/coverage/
+**/.angular/
+
+# Logs
+npm-debug.log*
