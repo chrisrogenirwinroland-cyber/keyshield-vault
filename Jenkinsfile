@@ -34,10 +34,28 @@ pipeline {
 
     stage('Checkout & Traceability') {
       steps {
-        // ✅ OPTION 1 FIX: wipe workspace so .git can’t be corrupted / detached
-        deleteDir()
+        // Windows-safe cleanup (replaces deleteDir()) to avoid "file is being used" locks
+        bat '''
+          echo ===== WORKSPACE CLEANUP (WINDOWS SAFE) =====
 
-        // fresh checkout (because skipDefaultCheckout(true))
+          rem Kill common lock-holder processes (ignore failures)
+          taskkill /F /IM node.exe /T 2>NUL
+          taskkill /F /IM npm.exe /T 2>NUL
+          taskkill /F /IM ng.exe /T 2>NUL
+          taskkill /F /IM docker.exe /T 2>NUL
+
+          cd /d "%WORKSPACE%"
+
+          rem Best-effort delete all files in workspace
+          del /F /Q /S * 2>NUL
+
+          rem Best-effort delete all folders in workspace
+          for /D %%G in (*) do rmdir /S /Q "%%G" 2>NUL
+
+          echo ===== CLEANUP DONE (BEST EFFORT) =====
+          dir
+        '''
+
         checkout scm
 
         bat """
@@ -48,7 +66,6 @@ pipeline {
           git status
         """
 
-        // ✅ FIX: compute SHA via bat (Windows-safe)
         script {
           def sha = bat(
             returnStdout: true,
@@ -206,7 +223,7 @@ pipeline {
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-api-image.json, reports/trivy-fe-image.json, reports/*.tar'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-api-image.json, reports/trivy-fe-image.json'
         }
       }
     }
@@ -249,7 +266,7 @@ pipeline {
           Write-Host "===== RELEASE SMOKE TEST ====="
           docker ps
 
-          # If API is restarting, capture logs early
+          # API state
           try {
             $restartCount = (docker inspect -f "{{.RestartCount}}" keyshield-api) -as [int]
             $status       = (docker inspect -f "{{.State.Status}}" keyshield-api)
@@ -263,25 +280,20 @@ pipeline {
             Write-Host "Could not inspect API container (maybe not created yet)."
           }
 
-          # Frontend
+          # Frontend root
           $fe = $env:FE_URL
-          try {
-            $r1 = Invoke-WebRequest $fe -UseBasicParsing -TimeoutSec 20
-            Write-Host ("FE Status: " + $r1.StatusCode)
-          } catch {
-            Write-Error "Frontend smoke test failed"
-            throw
-          }
+          $r1 = Invoke-WebRequest $fe -UseBasicParsing -TimeoutSec 20
+          Write-Host ("FE Status: " + $r1.StatusCode)
 
-          # API /health (fallback to root)
+          # API /health (fallback to /api/health if needed)
           $apiHealth = ($env:API_URL + "/health")
           try {
             $r2 = Invoke-WebRequest $apiHealth -UseBasicParsing -TimeoutSec 20
             Write-Host ("API /health Status: " + $r2.StatusCode)
           } catch {
-            Write-Host "No /health endpoint or it failed; trying API root..."
-            $r3 = Invoke-WebRequest $env:API_URL -UseBasicParsing -TimeoutSec 20
-            Write-Host ("API Root Status: " + $r3.StatusCode)
+            Write-Host "No /health endpoint; trying /api/health via FE proxy..."
+            $r3 = Invoke-WebRequest ($env:FE_URL + "/api/health") -UseBasicParsing -TimeoutSec 20
+            Write-Host ("FE /api/health Status: " + $r3.StatusCode)
           }
         ''')
       }
@@ -290,7 +302,7 @@ pipeline {
 
   post {
     always {
-      // ✅ FIX: make post step non-fatal even if container doesn’t exist
+      // IMPORTANT: Never fail post on missing container
       bat """
         docker ps
         docker logs keyshield-api --tail 120 2>NUL || echo No keyshield-api container logs available
