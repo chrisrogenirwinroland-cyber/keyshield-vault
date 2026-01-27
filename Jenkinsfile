@@ -34,28 +34,24 @@ pipeline {
   stages {
 
     stage('Checkout & Traceability') {
-      steps {
-        checkout scm
+  steps {
+    deleteDir()   // <-- hard reset workspace
+    checkout scm
 
-        bat """
-          echo ===== GIT TRACEABILITY =====
-          git --version
-          git rev-parse --short HEAD
-          git log -1 --pretty=oneline
-          git status
-        """
-
-        script {
-          def sha = bat(
-            returnStdout: true,
-            script: '@echo off\r\ngit rev-parse --short HEAD'
-          ).trim()
-
-          env.GIT_SHA = sha ?: "${env.BUILD_NUMBER}"
-          echo "Resolved GIT_SHA = ${env.GIT_SHA}"
-        }
-      }
+    bat """
+      echo ===== GIT TRACEABILITY =====
+      git --version
+      git rev-parse --short HEAD
+      git log -1 --pretty=oneline
+      git status
+    """
+    script {
+      def sha = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short HEAD').trim()
+      env.GIT_SHA = sha ?: "${env.BUILD_NUMBER}"
+      echo "Resolved GIT_SHA = ${env.GIT_SHA}"
     }
+  }
+}
 
     stage('Preflight (Toolchain Verification)') {
       steps {
