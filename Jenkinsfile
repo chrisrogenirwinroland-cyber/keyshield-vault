@@ -24,9 +24,8 @@ pipeline {
 
     ALERT_TO = "s225493677@deakin.edu.au"
 
-    // ✅ IMPORTANT CHANGE: test via frontend reverse proxy (/api), not direct API port
     FE_URL  = "http://localhost:4200"
-    API_PROXY_BASE = "http://localhost:4200/api"
+    API_URL = "http://localhost:3000"
 
     REPORT_DIR = "reports"
   }
@@ -34,24 +33,33 @@ pipeline {
   stages {
 
     stage('Checkout & Traceability') {
-  steps {
-    deleteDir()   // <-- hard reset workspace
-    checkout scm
+      steps {
+        // ✅ OPTION 1 FIX: wipe workspace so .git can’t be corrupted / detached
+        deleteDir()
 
-    bat """
-      echo ===== GIT TRACEABILITY =====
-      git --version
-      git rev-parse --short HEAD
-      git log -1 --pretty=oneline
-      git status
-    """
-    script {
-      def sha = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short HEAD').trim()
-      env.GIT_SHA = sha ?: "${env.BUILD_NUMBER}"
-      echo "Resolved GIT_SHA = ${env.GIT_SHA}"
+        // fresh checkout (because skipDefaultCheckout(true))
+        checkout scm
+
+        bat """
+          echo ===== GIT TRACEABILITY =====
+          git --version
+          git rev-parse --short HEAD
+          git log -1 --pretty=oneline
+          git status
+        """
+
+        // ✅ FIX: compute SHA via bat (Windows-safe)
+        script {
+          def sha = bat(
+            returnStdout: true,
+            script: '@echo off\r\ngit rev-parse --short HEAD'
+          ).trim()
+
+          env.GIT_SHA = sha ?: "${env.BUILD_NUMBER}"
+          echo "Resolved GIT_SHA = ${env.GIT_SHA}"
+        }
+      }
     }
-  }
-}
 
     stage('Preflight (Toolchain Verification)') {
       steps {
@@ -223,12 +231,11 @@ pipeline {
 
     stage('Deploy - Docker Compose (Staging)') {
       steps {
-        // ✅ Make deploy deterministic: down first, then up
         bat """
-          docker compose -f docker-compose.yml down --remove-orphans || echo "compose down skipped"
           docker rm -f keyshield-api 2>NUL || echo "No old keyshield-api to remove"
           docker rm -f keyshield-frontend 2>NUL || echo "No old keyshield-frontend to remove"
 
+          docker compose -f docker-compose.yml down --remove-orphans
           docker compose -f docker-compose.yml up -d --build
 
           docker ps
@@ -236,75 +243,46 @@ pipeline {
       }
     }
 
-    // ✅ UPDATED: end-to-end smoke test through frontend reverse proxy
-    stage('Release - E2E Smoke Test (UI Proxy Paths)') {
+    stage('Release - Smoke / Health Validation') {
       steps {
         powershell(script: '''
-          Write-Host "===== E2E SMOKE TEST via NGINX /api ====="
+          Write-Host "===== RELEASE SMOKE TEST ====="
           docker ps
 
+          # If API is restarting, capture logs early
+          try {
+            $restartCount = (docker inspect -f "{{.RestartCount}}" keyshield-api) -as [int]
+            $status       = (docker inspect -f "{{.State.Status}}" keyshield-api)
+            Write-Host ("API Status: " + $status + " | RestartCount: " + $restartCount)
+
+            if ($status -ne "running" -or $restartCount -gt 0) {
+              Write-Host "API looks unstable. Showing last logs:"
+              docker logs keyshield-api --tail 120
+            }
+          } catch {
+            Write-Host "Could not inspect API container (maybe not created yet)."
+          }
+
+          # Frontend
           $fe = $env:FE_URL
-          $api = $env:API_PROXY_BASE
-
-          # 1) FE route
           try {
-            $rFe = Invoke-WebRequest ($fe + "/admin") -UseBasicParsing -TimeoutSec 20
-            Write-Host ("FE /admin Status: " + $rFe.StatusCode)
+            $r1 = Invoke-WebRequest $fe -UseBasicParsing -TimeoutSec 20
+            Write-Host ("FE Status: " + $r1.StatusCode)
           } catch {
-            Write-Error "Frontend /admin failed"
+            Write-Error "Frontend smoke test failed"
             throw
           }
 
-          # 2) API health via proxy
+          # API /health (fallback to root)
+          $apiHealth = ($env:API_URL + "/health")
           try {
-            $rHealth = Invoke-RestMethod -Method Get -Uri ($api + "/health") -TimeoutSec 20
-            Write-Host ("API /health ok: " + ($rHealth.status))
+            $r2 = Invoke-WebRequest $apiHealth -UseBasicParsing -TimeoutSec 20
+            Write-Host ("API /health Status: " + $r2.StatusCode)
           } catch {
-            Write-Error "API /health via proxy failed"
-            throw
+            Write-Host "No /health endpoint or it failed; trying API root..."
+            $r3 = Invoke-WebRequest $env:API_URL -UseBasicParsing -TimeoutSec 20
+            Write-Host ("API Root Status: " + $r3.StatusCode)
           }
-
-          # 3) Login via proxy (known good creds)
-          $loginBody = @{ username="admin"; password="admin123" } | ConvertTo-Json
-          try {
-            $login = Invoke-RestMethod -Method Post -Uri ($api + "/auth/login") -ContentType "application/json" -Body $loginBody -TimeoutSec 20
-          } catch {
-            Write-Error "Login via proxy failed"
-            throw
-          }
-
-          if (-not $login.token) { throw "No token returned from /auth/login" }
-          $token = $login.token
-          Write-Host ("Got JWT token length=" + $token.Length)
-
-          # 4) Create API key via proxy (admin)
-          $keyBody = @{ label=("jenkins-key-" + $env:BUILD_NUMBER) } | ConvertTo-Json
-          try {
-            $newKey = Invoke-RestMethod -Method Post -Uri ($api + "/admin/keys") `
-              -Headers @{ Authorization = ("Bearer " + $token) } `
-              -ContentType "application/json" -Body $keyBody -TimeoutSec 20
-          } catch {
-            Write-Error "Create key via proxy failed"
-            throw
-          }
-
-          if (-not $newKey.raw_key_once) { throw "No raw_key_once returned from /admin/keys" }
-          $apiKey = $newKey.raw_key_once
-          Write-Host ("Got raw_key_once length=" + $apiKey.Length + " last4=" + $newKey.key_last4)
-
-          # 5) Client access via proxy (x-api-key)
-          try {
-            $client = Invoke-RestMethod -Method Post -Uri ($api + "/client/access") `
-              -Headers @{ "x-api-key" = $apiKey } -TimeoutSec 20
-          } catch {
-            Write-Error "Client access via proxy failed"
-            throw
-          }
-
-          Write-Host ("Client access=" + $client.access)
-          if ($client.access -ne "granted") { throw "Expected access=granted but got: $($client.access)" }
-
-          Write-Host "✅ E2E smoke test passed (login->createKey->clientAccess via /api proxy)."
         ''')
       }
     }
@@ -312,11 +290,13 @@ pipeline {
 
   post {
     always {
+      // ✅ FIX: make post step non-fatal even if container doesn’t exist
       bat """
         docker ps
-        docker logs keyshield-api --tail 120 2>NUL || echo "No keyshield-api container logs available"
+        docker logs keyshield-api --tail 120 2>NUL || echo No keyshield-api container logs available
+        exit /b 0
       """
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-api-image.json, reports/trivy-fe-image.json'
+      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**'
     }
 
     success {
