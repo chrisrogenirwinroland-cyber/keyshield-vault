@@ -320,7 +320,7 @@ pipeline {
         docker ps
         docker logs keyshield-api --tail 120 2>NUL || echo "No keyshield-api container logs available"
       """
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**'
+      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-api-image.json, reports/trivy-fe-image.json'
     }
 
     success {
