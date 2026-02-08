@@ -1,5 +1,3 @@
-// Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, Docker, Email alerts)
-
 pipeline {
   agent any
 
@@ -835,6 +833,6 @@ Grafana:    $env:GRAFANA_URL
       )
     }
 
-  } // end post
+  } 
 
-} // end pipeline
+} 
