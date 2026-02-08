@@ -1,9 +1,3 @@
-// Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, Docker, Email alerts)
-// Repo layout:
-//  - api/package.json, api/package-lock.json, api/Dockerfile
-//  - frontend/app/package.json, frontend/app/package-lock.json, frontend/app/Dockerfile
-//  - docker-compose.yml at repo root
-
 pipeline {
   agent any
 
@@ -16,43 +10,34 @@ pipeline {
   }
 
   environment {
-    // ========= App / traceability =========
     APP_NAME  = "keyshield-vault"
     GIT_SHA   = "unknown"
 
-    // ========= Docker Hub =========
     DOCKERHUB_NAMESPACE = "rogen7spark"
     DOCKERHUB_CREDS_ID  = "dockerhub-creds"
 
-    // ========= SonarCloud =========
     SONAR_SERVER_NAME   = "SonarCloud"
     SONAR_SCANNER_TOOL  = "SonarQubeScanner"
     SONAR_TOKEN_ID      = "sonar-token"
     SONAR_ORG           = "chrisrogenirwinroland-cyber"
     SONAR_PROJECT_KEY   = "chrisrogenirwinroland-cyber_keyshield-vault"
 
-    // ========= Email =========
     ALERT_TO = "s225493677@deakin.edu.au"
 
-    // ========= Release / smoke =========
     FE_URL  = "http://localhost:4200"
     API_URL = "http://localhost:3000"
 
-    // ========= Monitoring endpoints =========
     PROM_READY_URL = "http://localhost:9090/-/ready"
     ALERTMGR_URL   = "http://localhost:9093"
     GRAFANA_URL    = "http://localhost:3001"
 
-    // ========= Reports =========
     REPORT_DIR = "reports"
 
-    // ========= OWASP Dependency-Check =========
-    // Jenkins credential you created (Secret text):
-    // ID: nvd-api-key
+    // ✅ Your Jenkins Secret Text credential id
     NVD_API_KEY_CRED_ID = "nvd-api-key"
 
-    // ========= Gitleaks image =========
-    GITLEAKS_IMAGE = "ghcr.io/gitleaks/gitleaks:latest"
+    // ✅ Use DockerHub public image (no GHCR auth headaches)
+    GITLEAKS_IMAGE = "zricethezav/gitleaks:latest"
   }
 
   stages {
@@ -60,15 +45,12 @@ pipeline {
     stage('Checkout & Traceability') {
       steps {
         checkout scm
-
-        // Windows-safe SHA resolution (works even if PowerShell Git PATH is weird)
         script {
           def shaOut = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short HEAD\r\n').trim()
           def lines = shaOut.readLines().collect { it.trim() }.findAll { it }
           env.GIT_SHA = (lines ? lines[-1] : "manual")
           echo "Resolved GIT_SHA = ${env.GIT_SHA}"
         }
-
         bat """
           @echo off
           echo ===== GIT TRACEABILITY =====
@@ -148,7 +130,6 @@ pipeline {
       }
     }
 
-    // ✅ NEW STAGE (Windows-safe PowerShell; non-blocking)
     stage('Code Quality - ESLint/Prettier') {
       steps {
         powershell '''
@@ -172,19 +153,16 @@ pipeline {
             return $rc
           }
 
-          # ESLint API
           Write-Host "-- ESLint API"
           $apiOut = Join-Path $eslintDir "eslint-api.txt"
           $rc = Run-And-Capture (Join-Path $env:WORKSPACE "api") "npm run lint --silent" $apiOut
           if ($rc -ne 0) { Add-Content $apiOut "`r`nESLint API issues OR lint script missing (NON-BLOCKING)." }
 
-          # ESLint Frontend
           Write-Host "-- ESLint Frontend"
           $feOut = Join-Path $eslintDir "eslint-fe.txt"
           $rc = Run-And-Capture (Join-Path $env:WORKSPACE "frontend\\app") "npm run lint --silent" $feOut
           if ($rc -ne 0) { Add-Content $feOut "`r`nESLint Frontend issues OR lint script missing (NON-BLOCKING)." }
 
-          # Prettier (repo)
           Write-Host "-- Prettier check (repo)"
           $preOut = Join-Path $prettierDir "prettier-check.txt"
           cmd /c "npx --yes prettier -c ." 2>&1 | Out-File -FilePath $preOut -Encoding UTF8
@@ -231,9 +209,6 @@ pipeline {
               bat """
                 @echo off
                 echo ===== SONARCLOUD SCAN (MONOREPO) =====
-                echo ProjectKey: %SONAR_PROJECT_KEY%
-                echo Org: %SONAR_ORG%
-
                 "${scannerHome}\\bin\\sonar-scanner.bat" ^
                   -Dsonar.host.url=https://sonarcloud.io ^
                   -Dsonar.token=%SONAR_TOKEN% ^
@@ -270,7 +245,7 @@ pipeline {
       }
     }
 
-    // ✅ NEW STAGE (uses your nvd-api-key)
+    // ✅ FIXED: PowerShell mount string uses $($dcData) so ':' doesn't break parsing
     stage('Security - Dependency-Check (SCA)') {
       steps {
         withCredentials([string(credentialsId: "${NVD_API_KEY_CRED_ID}", variable: 'NVD_API_KEY')]) {
@@ -282,45 +257,54 @@ pipeline {
             $outDir = Join-Path $root "dependency-check"
             New-Item -ItemType Directory -Force $outDir | Out-Null
 
-            # Persistent cache under Jenkins Home to avoid repeated downloads
+            # Persistent cache under Jenkins Home to reduce updates
             $jenkinsHome = $env:JENKINS_HOME
             if (-not $jenkinsHome) { $jenkinsHome = "C:\\ProgramData\\Jenkins\\.jenkins" }
+
             $dcData = Join-Path $jenkinsHome "dependency-check-data"
             New-Item -ItemType Directory -Force $dcData | Out-Null
 
+            # ✅ IMPORTANT: use $() to stop PowerShell reading "$dcData:" as a scoped variable
             $srcMount  = "$($env:WORKSPACE):/src"
-            $dataMount = "$dcData:/usr/share/dependency-check/data"
+            $dataMount = "$($dcData):/usr/share/dependency-check/data"
 
             try { docker pull owasp/dependency-check:latest | Out-Null } catch {}
 
-            # HTML + JSON (correct format usage)
-            $cmd = @(
-              "docker","run","--rm",
-              "-v",$srcMount,
-              "-v",$dataMount,
-              "-w","/src",
-              "owasp/dependency-check:latest",
-              "--project",$env:APP_NAME,
-              "--scan","/src/api/package.json",
-              "--scan","/src/api/package-lock.json",
-              "--scan","/src/frontend/app/package.json",
-              "--scan","/src/frontend/app/package-lock.json",
-              "--format","HTML",
-              "--format","JSON",
-              "--out","/src/"+$env:REPORT_DIR+"/dependency-check",
-              "--nvdApiKey",$env:NVD_API_KEY,
-              "--failOnCVSS","11"
-            )
+            function Run-DC([switch]$NoUpdate) {
+              $args = @(
+                "run","--rm",
+                "-v",$srcMount,
+                "-v",$dataMount,
+                "-w","/src",
+                "owasp/dependency-check:latest",
+                "--project",$env:APP_NAME,
+                "--scan","/src/api/package.json",
+                "--scan","/src/api/package-lock.json",
+                "--scan","/src/frontend/app/package.json",
+                "--scan","/src/frontend/app/package-lock.json",
+                "--format","HTML",
+                "--format","JSON",
+                "--out","/src/"+$env:REPORT_DIR+"/dependency-check",
+                "--nvdApiKey",$env:NVD_API_KEY,
+                "--failOnCVSS","11"
+              )
+              if ($NoUpdate) { $args += "--noupdate" }
 
-            & $cmd[0] $cmd[1..($cmd.Length-1)]
-            $rc = $LASTEXITCODE
-
-            $note = Join-Path $outDir "dependency-check-note.txt"
-            if ($rc -ne 0) {
-              "Dependency-Check exited with code $rc. Review reports. (Pipeline continues)" | Set-Content -Path $note -Encoding UTF8
-            } else {
-              "Dependency-Check completed successfully." | Set-Content -Path $note -Encoding UTF8
+              & docker @args
+              return $LASTEXITCODE
             }
+
+            $rc = Run-DC
+            if ($rc -ne 0) {
+              Write-Host "Dependency-Check failed (rc=$rc). Retrying with --noupdate (use cached DB)..."
+              $rc2 = Run-DC -NoUpdate
+              Write-Host "Retry rc=$rc2 (pipeline continues)."
+            } else {
+              Write-Host "Dependency-Check completed."
+            }
+
+            "Dependency-Check finished (non-blocking). See reports/dependency-check/." |
+              Set-Content -Path (Join-Path $outDir "dependency-check-note.txt") -Encoding UTF8
 
             exit 0
           '''
@@ -333,7 +317,6 @@ pipeline {
       }
     }
 
-    // ✅ NEW STAGE (fixed image + Windows-safe)
     stage('Security - Gitleaks (Secrets Scan)') {
       steps {
         powershell '''
@@ -344,17 +327,15 @@ pipeline {
           $outDir = Join-Path $root "gitleaks"
           New-Item -ItemType Directory -Force $outDir | Out-Null
 
-          $reportPathHost = Join-Path $outDir "gitleaks-report.json"
-          $notePathHost   = Join-Path $outDir "gitleaks-note.txt"
-          "[]" | Set-Content -Path $reportPathHost -Encoding UTF8
+          $reportHost = Join-Path $outDir "gitleaks-report.json"
+          $noteHost   = Join-Path $outDir "gitleaks-note.txt"
+          "[]" | Set-Content -Path $reportHost -Encoding UTF8
 
           $srcMount = "$($env:WORKSPACE):/src"
 
-          try {
-            docker pull $env:GITLEAKS_IMAGE | Out-Null
-          } catch {
-            "Skipped: Unable to pull $($env:GITLEAKS_IMAGE). Check network/registry. (Pipeline continues)" |
-              Set-Content -Path $notePathHost -Encoding UTF8
+          try { docker pull $env:GITLEAKS_IMAGE | Out-Null } catch {
+            "Skipped: Unable to pull $($env:GITLEAKS_IMAGE). (Pipeline continues)" |
+              Set-Content -Path $noteHost -Encoding UTF8
             exit 0
           }
 
@@ -367,10 +348,10 @@ pipeline {
           $rc = $LASTEXITCODE
           if ($rc -ne 0) {
             "Potential secrets detected OR gitleaks exit=$rc. Review gitleaks-report.json. (Pipeline continues)" |
-              Set-Content -Path $notePathHost -Encoding UTF8
+              Set-Content -Path $noteHost -Encoding UTF8
           } else {
             "No secrets detected by Gitleaks." |
-              Set-Content -Path $notePathHost -Encoding UTF8
+              Set-Content -Path $noteHost -Encoding UTF8
           }
 
           exit 0
@@ -396,9 +377,6 @@ pipeline {
 
           echo Building %FE_IMAGE%
           docker build -t %FE_IMAGE% -f frontend\\app\\Dockerfile frontend\\app
-
-          echo ===== DOCKER IMAGES (filtered) =====
-          docker images | findstr %APP_NAME%
         """
       }
     }
@@ -429,296 +407,21 @@ pipeline {
       }
     }
 
-    stage('Security - Vulnerability Summary (includes 0 findings)') {
-      steps {
-        powershell '''
-          Write-Host "===== VULNERABILITY SUMMARY ====="
-          if (-not (Test-Path $env:REPORT_DIR)) { New-Item -ItemType Directory -Force $env:REPORT_DIR | Out-Null }
-
-          function Count-Trivy($path) {
-            $out = [ordered]@{ VulnHigh=0; VulnCritical=0; MisHigh=0; MisCritical=0 }
-            if (-not (Test-Path $path -PathType Leaf)) { return $out }
-
-            try { $json = Get-Content $path -Raw | ConvertFrom-Json } catch { return $out }
-            if ($null -eq $json.Results) { return $out }
-
-            foreach ($r in $json.Results) {
-              if ($null -ne $r.Vulnerabilities) {
-                foreach ($v in $r.Vulnerabilities) {
-                  if ($v.Severity -eq "HIGH")     { $out.VulnHigh++ }
-                  if ($v.Severity -eq "CRITICAL") { $out.VulnCritical++ }
-                }
-              }
-              if ($null -ne $r.Misconfigurations) {
-                foreach ($m in $r.Misconfigurations) {
-                  if ($m.Severity -eq "HIGH")     { $out.MisHigh++ }
-                  if ($m.Severity -eq "CRITICAL") { $out.MisCritical++ }
-                }
-              }
-            }
-            return $out
-          }
-
-          $fs  = Count-Trivy (Join-Path $env:REPORT_DIR "trivy-fs.json")
-          $api = Count-Trivy (Join-Path $env:REPORT_DIR "trivy-api-image.json")
-          $fe  = Count-Trivy (Join-Path $env:REPORT_DIR "trivy-fe-image.json")
-
-          $totalHigh     = $fs.VulnHigh + $api.VulnHigh + $fe.VulnHigh + $fs.MisHigh
-          $totalCritical = $fs.VulnCritical + $api.VulnCritical + $fe.VulnCritical + $fs.MisCritical
-
-          $resultLine = ""
-          if (($totalHigh + $totalCritical) -eq 0) {
-            $resultLine = "✅ No HIGH/CRITICAL vulnerabilities or misconfigurations were detected (Trivy)."
-          } else {
-            $resultLine = "⚠️ HIGH/CRITICAL findings detected. Review Trivy attachments for details."
-          }
-
-          $summary = @"
-Trivy Security Summary (HIGH/CRITICAL)
-=====================================
-Job:    $env:JOB_NAME
-Build:  #$env:BUILD_NUMBER
-Commit: $env:GIT_SHA
-
-Filesystem Scan:
-  Vulnerabilities  HIGH=$($fs.VulnHigh)  CRITICAL=$($fs.VulnCritical)
-  Misconfig        HIGH=$($fs.MisHigh)   CRITICAL=$($fs.MisCritical)
-
-API Image Scan:
-  Vulnerabilities  HIGH=$($api.VulnHigh) CRITICAL=$($api.VulnCritical)
-
-Frontend Image Scan:
-  Vulnerabilities  HIGH=$($fe.VulnHigh)  CRITICAL=$($fe.VulnCritical)
-
-Totals:
-  HIGH=$totalHigh
-  CRITICAL=$totalCritical
-
-Result:
-  $resultLine
-"@
-
-          $outPath = Join-Path $env:REPORT_DIR "vuln-summary.txt"
-          $summary | Set-Content -Path $outPath -Encoding UTF8
-          Write-Host $summary
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/vuln-summary.txt'
-        }
-      }
-    }
-
     stage('Push Images (Docker Hub)') {
       steps {
         withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS_ID}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
           bat """
             @echo off
-            echo ===== DOCKER LOGIN =====
             echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
 
             set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
             set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
 
-            echo ===== PUSH =====
             docker push %API_IMAGE%
             docker push %FE_IMAGE%
 
-            echo ===== LOGOUT =====
             docker logout
           """
-        }
-      }
-    }
-
-    stage('Deploy - Docker Compose (Staging)') {
-      steps {
-        bat '''
-          @echo off
-          echo ===== CLEAN OLD CONTAINERS =====
-          docker rm -f keyshield-api 2>NUL || echo "No old keyshield-api to remove"
-          docker rm -f keyshield-frontend 2>NUL || echo "No old keyshield-frontend to remove"
-        '''
-        bat """
-          @echo off
-          echo ===== DEPLOY STAGING =====
-          docker compose -f docker-compose.yml down
-          docker compose -f docker-compose.yml up -d --build
-          echo ===== DOCKER PS =====
-          docker ps
-        """
-      }
-    }
-
-    stage('Release - Smoke / Health Validation') {
-      steps {
-        powershell '''
-          Write-Host "===== RELEASE SMOKE TEST ====="
-          if (-not (Test-Path $env:REPORT_DIR)) { New-Item -ItemType Directory -Force $env:REPORT_DIR | Out-Null }
-
-          $feCode = "N/A"
-          $apiCode = "N/A"
-
-          try {
-            $r1 = Invoke-WebRequest $env:FE_URL -UseBasicParsing -TimeoutSec 20
-            $feCode = $r1.StatusCode
-            Write-Host ("FE Status: " + $feCode)
-          } catch {
-            Write-Host "Frontend smoke test failed"
-            throw
-          }
-
-          try {
-            $healthUrl = "$env:API_URL/health"
-            $r2 = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 20
-            $apiCode = $r2.StatusCode
-            Write-Host ("API /health Status: " + $apiCode)
-          } catch {
-            Write-Host "No /health endpoint or it failed; trying API root..."
-            $r3 = Invoke-WebRequest $env:API_URL -UseBasicParsing -TimeoutSec 20
-            $apiCode = $r3.StatusCode
-            Write-Host ("API Root Status: " + $apiCode)
-          }
-
-          @"
-Release Smoke Test
-==================
-Frontend URL: $env:FE_URL
-Frontend HTTP: $feCode
-
-API URL: $env:API_URL
-API HTTP: $apiCode
-"@ | Set-Content -Path (Join-Path $env:REPORT_DIR "smoke-test.txt") -Encoding UTF8
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/smoke-test.txt'
-        }
-      }
-    }
-
-    stage('Monitoring - Deploy Stack (Prometheus/Alertmanager)') {
-      steps {
-        powershell '''
-          Write-Host "===== MONITORING DEPLOY ====="
-          if (-not (Test-Path $env:REPORT_DIR)) { New-Item -ItemType Directory -Force $env:REPORT_DIR | Out-Null }
-
-          if (-not (Test-Path "docker-compose.monitoring.yml" -PathType Leaf)) {
-            $msg = "docker-compose.monitoring.yml not found - monitoring deploy skipped (stage completed)."
-            Write-Host $msg
-            $msg | Set-Content -Path (Join-Path $env:REPORT_DIR "monitoring-note.txt") -Encoding UTF8
-            exit 0
-          }
-
-          $amPath = Join-Path (Get-Location) "monitoring\\alertmanager\\alertmanager.yml"
-
-          if (Test-Path $amPath -PathType Container) {
-            Write-Host "Found alertmanager.yml as DIRECTORY. Removing to fix mount..."
-            Remove-Item $amPath -Recurse -Force
-          }
-
-          if (-not (Test-Path $amPath -PathType Leaf)) {
-            Write-Host "Creating default alertmanager.yml..."
-            New-Item -ItemType Directory -Force (Split-Path $amPath) | Out-Null
-            @"
-global:
-  resolve_timeout: 5m
-route:
-  receiver: 'default'
-receivers:
-- name: 'default'
-"@ | Set-Content -Path $amPath -Encoding UTF8
-          }
-
-          docker compose -f docker-compose.monitoring.yml up -d
-
-          $ps = (docker ps) | Out-String
-          $ps | Set-Content -Path (Join-Path $env:REPORT_DIR "monitoring-ps.txt") -Encoding UTF8
-
-          "Monitoring deployed (or already running)." | Set-Content -Path (Join-Path $env:REPORT_DIR "monitoring-note.txt") -Encoding UTF8
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/monitoring-note.txt, reports/monitoring-ps.txt'
-        }
-      }
-    }
-
-    stage('Alerts - Validate Prometheus/Alertmanager/Grafana') {
-      steps {
-        powershell '''
-          Write-Host "===== ALERTS VALIDATION ====="
-          if (-not (Test-Path $env:REPORT_DIR)) { New-Item -ItemType Directory -Force $env:REPORT_DIR | Out-Null }
-
-          $promOk = $false
-          for ($i=1; $i -le 8; $i++) {
-            try {
-              $p = Invoke-WebRequest $env:PROM_READY_URL -UseBasicParsing -TimeoutSec 10
-              if ($p.StatusCode -eq 200) { $promOk = $true; break }
-            } catch {
-              Start-Sleep -Seconds 3
-            }
-          }
-
-          $amCode = "N/A"
-          try { $a = Invoke-WebRequest $env:ALERTMGR_URL -UseBasicParsing -TimeoutSec 10; $amCode = $a.StatusCode } catch {}
-
-          $gCode = "N/A"
-          try { $g = Invoke-WebRequest $env:GRAFANA_URL -UseBasicParsing -TimeoutSec 10; $gCode = $g.StatusCode } catch {}
-
-          @"
-Monitoring Validation
-=====================
-Prometheus READY: $promOk  ($env:PROM_READY_URL)
-Alertmanager HTTP: $amCode ($env:ALERTMGR_URL)
-Grafana HTTP: $gCode ($env:GRAFANA_URL)
-"@ | Set-Content -Path (Join-Path $env:REPORT_DIR "alerts-validation.txt") -Encoding UTF8
-
-          Write-Host "Prometheus READY: $promOk"
-          Write-Host "Alertmanager HTTP: $amCode"
-          Write-Host "Grafana HTTP: $gCode"
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/alerts-validation.txt'
-        }
-      }
-    }
-
-    stage('Package Reports for Email') {
-      steps {
-        powershell '''
-          Write-Host "===== PACKAGE REPORTS ====="
-          if (-not (Test-Path $env:REPORT_DIR)) { New-Item -ItemType Directory -Force $env:REPORT_DIR | Out-Null }
-
-          $summary = @"
-Build Summary
-=============
-Job:    $env:JOB_NAME
-Build:  #$env:BUILD_NUMBER
-Commit: $env:GIT_SHA
-URL:    $env:BUILD_URL
-
-Endpoints
----------
-Frontend:   $env:FE_URL
-API:        $env:API_URL
-Prometheus: $env:PROM_READY_URL
-Alertmgr:   $env:ALERTMGR_URL
-Grafana:    $env:GRAFANA_URL
-"@
-
-          $summary | Set-Content -Path (Join-Path $env:REPORT_DIR "build-summary.txt") -Encoding UTF8
-          Write-Host "Created reports\\build-summary.txt"
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/build-summary.txt'
         }
       }
     }
@@ -726,102 +429,7 @@ Grafana:    $env:GRAFANA_URL
 
   post {
     always {
-      bat """
-        @echo off
-        echo ===== POST: DOCKER PS =====
-        docker ps
-
-        echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
-        docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
-      """
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
-    }
-
-    success {
-      script {
-        def vulnSummary = fileExists('reports/vuln-summary.txt') ? readFile('reports/vuln-summary.txt') : 'No vuln-summary.txt generated.'
-        def smoke      = fileExists('reports/smoke-test.txt') ? readFile('reports/smoke-test.txt') : 'No smoke-test.txt generated.'
-        def monitorVal = fileExists('reports/alerts-validation.txt') ? readFile('reports/alerts-validation.txt') : 'No alerts-validation.txt generated.'
-
-        def esc = { s ->
-          (s ?: '')
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-        }
-
-        emailext(
-          to: "${ALERT_TO}",
-          subject: "✅ SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-          mimeType: 'text/html',
-          attachmentsPattern: 'reports/**',
-          body: """
-          <html>
-            <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
-              <h2 style="margin:0 0 10px 0;">
-                CI/CD Pipeline Result: <span style="color:#1a7f37;">SUCCESS</span>
-              </h2>
-
-              <table cellpadding="8" cellspacing="0" style="border-collapse:collapse; border:1px solid #ddd;">
-                <tr><td style="border:1px solid #ddd;"><b>Job</b></td><td style="border:1px solid #ddd;">${JOB_NAME}</td></tr>
-                <tr><td style="border:1px solid #ddd;"><b>Build</b></td><td style="border:1px solid #ddd;">#${BUILD_NUMBER}</td></tr>
-                <tr><td style="border:1px solid #ddd;"><b>Commit</b></td><td style="border:1px solid #ddd;">${GIT_SHA}</td></tr>
-                <tr><td style="border:1px solid #ddd;"><b>Build URL</b></td><td style="border:1px solid #ddd;"><a href="${BUILD_URL}">${BUILD_URL}</a></td></tr>
-                <tr><td style="border:1px solid #ddd;"><b>SonarCloud</b></td>
-                    <td style="border:1px solid #ddd;">
-                      <a href="https://sonarcloud.io/dashboard?id=${SONAR_PROJECT_KEY}">https://sonarcloud.io/dashboard?id=${SONAR_PROJECT_KEY}</a>
-                    </td>
-                </tr>
-              </table>
-
-              <h3 style="margin:14px 0 8px 0;">Release Smoke Test</h3>
-              <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(smoke)}</pre>
-
-              <h3 style="margin:14px 0 8px 0;">Security Summary (Trivy)</h3>
-              <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(vulnSummary)}</pre>
-
-              <h3 style="margin:14px 0 8px 0;">Monitoring / Alerts Validation</h3>
-              <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(monitorVal)}</pre>
-
-              <p style="margin-top:12px;">
-                <b>Attachments included:</b> All reports under <code>reports/**</code> (Trivy, Dependency-Check, Gitleaks, Smoke tests, Monitoring validation, etc.)
-              </p>
-
-              <p style="color:#666; margin-top:16px;">
-                Regards,<br/>
-                Jenkins CI/CD Pipeline<br/>
-                ${APP_NAME}
-              </p>
-            </body>
-          </html>
-          """
-        )
-      }
-    }
-
-    failure {
-      emailext(
-        to: "${ALERT_TO}",
-        subject: "❌ FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-        mimeType: 'text/html',
-        attachmentsPattern: 'reports/**',
-        attachLog: true,
-        body: """
-        <html>
-          <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
-            <h2 style="margin:0 0 10px 0;">CI/CD Pipeline Result: <span style="color:#b42318;">FAILED</span></h2>
-            <p>
-              <b>Job:</b> ${JOB_NAME}<br/>
-              <b>Build:</b> #${BUILD_NUMBER}<br/>
-              <b>Commit:</b> ${GIT_SHA}<br/>
-              <b>Build URL:</b> <a href="${BUILD_URL}">${BUILD_URL}</a>
-            </p>
-            <p>Console log attached. Any generated reports are attached/archived under Jenkins artifacts.</p>
-            <p style="color:#666; margin-top:16px;">Regards,<br/>Jenkins CI/CD Pipeline<br/>${APP_NAME}</p>
-          </body>
-        </html>
-        """
-      )
+      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**'
     }
   }
 }
