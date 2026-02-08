@@ -26,7 +26,7 @@ pipeline {
 
     // Jenkins credential IDs (UPDATE to match your Jenkins)
     DOCKER_CRED_ID      = "dockerhub-creds"     // Username with password
-    SONAR_TOKEN_CRED_ID = "sonarcloud-token"    // Secret text (optional)
+    SONAR_TOKEN_CRED_ID = "sonar-token"    // Secret text (optional)
 
     // SonarCloud (optional)
     SONAR_HOST_URL    = "https://sonarcloud.io"
