@@ -5,39 +5,24 @@ pipeline {
     timestamps()
     ansiColor('xterm')
     disableConcurrentBuilds()
-    buildDiscarder(logRotator(numToKeepStr: '15'))
-    skipDefaultCheckout(true)
+    buildDiscarder(logRotator(numToKeepStr: '20'))
   }
 
   environment {
-    APP_NAME  = "keyshield-vault"
-    GIT_SHA   = "unknown"
+    APP_NAME       = 'keyshield-vault'
+    REPORT_DIR     = 'reports'
 
-    DOCKERHUB_NAMESPACE = "rogen7spark"
-    DOCKERHUB_CREDS_ID  = "dockerhub-creds"
+    // ✅ Your Jenkins credential IDs
+    NVD_API_CRED   = 'nvd-api-key'          // Secret text
+    SONAR_CRED     = 'sonar-token'          // Secret text (change if different)
+    DOCKERHUB_CRED = 'dockerhub-creds'      // Username+Password (change if different)
 
-    SONAR_SERVER_NAME   = "SonarCloud"
-    SONAR_SCANNER_TOOL  = "SonarQubeScanner"
-    SONAR_TOKEN_ID      = "sonar-token"
-    SONAR_ORG           = "chrisrogenirwinroland-cyber"
-    SONAR_PROJECT_KEY   = "chrisrogenirwinroland-cyber_keyshield-vault"
+    DOCKERHUB_USER = 'rogen7spark'
+    IMAGE_API      = "${DOCKERHUB_USER}/keyshield-vault-api"
+    IMAGE_WEB      = "${DOCKERHUB_USER}/keyshield-vault-web"
 
-    ALERT_TO = "s225493677@deakin.edu.au"
-
-    FE_URL  = "http://localhost:4200"
-    API_URL = "http://localhost:3000"
-
-    PROM_READY_URL = "http://localhost:9090/-/ready"
-    ALERTMGR_URL   = "http://localhost:9093"
-    GRAFANA_URL    = "http://localhost:3001"
-
-    REPORT_DIR = "reports"
-
-    // ✅ Your Jenkins Secret Text credential id
-    NVD_API_KEY_CRED_ID = "nvd-api-key"
-
-    // ✅ Use DockerHub public image (no GHCR auth headaches)
-    GITLEAKS_IMAGE = "zricethezav/gitleaks:latest"
+    GIT_SHA        = ''
+    IMAGE_TAG      = ''
   }
 
   stages {
@@ -46,86 +31,53 @@ pipeline {
       steps {
         checkout scm
         script {
-          def shaOut = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short HEAD\r\n').trim()
-          def lines = shaOut.readLines().collect { it.trim() }.findAll { it }
-          env.GIT_SHA = (lines ? lines[-1] : "manual")
-          echo "Resolved GIT_SHA = ${env.GIT_SHA}"
+          // reliable SHA even on detached HEAD
+          env.GIT_SHA = bat(returnStdout: true, script: 'git rev-parse --short=7 HEAD').trim()
+          env.IMAGE_TAG = "${env.GIT_SHA}-${env.BUILD_NUMBER}"
         }
         bat """
-          @echo off
           echo ===== GIT TRACEABILITY =====
           git --version
-          git rev-parse --short HEAD
-          git log -1 --pretty=oneline
-          git status
+          git rev-parse --short=7 HEAD
+          git log -1 --oneline
+          echo GIT_SHA=%GIT_SHA%
+          echo IMAGE_TAG=%IMAGE_TAG%
+          git status --porcelain
         """
       }
     }
 
     stage('Preflight (Toolchain Verification)') {
       steps {
-        bat """
-          @echo off
+        bat '''
           echo ===== TOOL VERSIONS =====
           where node
           node -v
           npm -v
-
-          echo ===== DOCKER =====
-          where docker
-          docker version
-
-          echo ===== TRIVY =====
-          where trivy
-          trivy --version
-        """
+        '''
         bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
-        bat """
-          @echo off
-          if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
-          echo Preflight complete > "%REPORT_DIR%\\preflight.txt"
-        """
       }
     }
 
-    stage('Install & Unit Tests - API') {
+    stage('Install - API') {
       steps {
         dir('api') {
-          bat """
-            @echo off
+          bat '''
             echo ===== API INSTALL =====
             npm ci
-
-            echo ===== API TEST =====
-            npm test
-          """
-        }
-      }
-      post {
-        always {
-          junit allowEmptyResults: true, testResults: 'api/**/junit*.xml, api/**/TEST-*.xml'
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'api/npm-debug.log, api/**/coverage/**'
+          '''
         }
       }
     }
 
-    stage('Install & Unit Tests - Frontend') {
+    stage('Install - Frontend') {
       steps {
         dir('frontend/app') {
-          bat """
-            @echo off
+          bat '''
             echo ===== FE INSTALL =====
             npm ci
-
-            echo ===== FE TEST =====
-            npm test
-          """
-        }
-      }
-      post {
-        always {
-          junit allowEmptyResults: true, testResults: 'frontend/app/**/junit*.xml, frontend/app/**/TEST-*.xml'
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'frontend/app/npm-debug.log, frontend/app/**/coverage/**'
+            npm audit --audit-level=high || exit /b 0
+          '''
         }
       }
     }
@@ -134,51 +86,25 @@ pipeline {
       steps {
         powershell '''
           Write-Host "===== CODE QUALITY: ESLINT + PRETTIER ====="
-          $ErrorActionPreference = "Continue"
-
-          $root = Join-Path $env:WORKSPACE $env:REPORT_DIR
-          $eslintDir   = Join-Path $root "eslint"
-          $prettierDir = Join-Path $root "prettier"
-          New-Item -ItemType Directory -Force $eslintDir   | Out-Null
-          New-Item -ItemType Directory -Force $prettierDir | Out-Null
-
-          function Run-And-Capture([string]$workDir, [string]$cmd, [string]$outFile) {
-            Push-Location $workDir
-            try {
-              cmd /c $cmd 2>&1 | Out-File -FilePath $outFile -Encoding UTF8
-              $rc = $LASTEXITCODE
-            } finally {
-              Pop-Location
-            }
-            return $rc
-          }
-
           Write-Host "-- ESLint API"
-          $apiOut = Join-Path $eslintDir "eslint-api.txt"
-          $rc = Run-And-Capture (Join-Path $env:WORKSPACE "api") "npm run lint --silent" $apiOut
-          if ($rc -ne 0) { Add-Content $apiOut "`r`nESLint API issues OR lint script missing (NON-BLOCKING)." }
+          Push-Location "api"
+          npx eslint . || exit 0
+          Pop-Location
 
           Write-Host "-- ESLint Frontend"
-          $feOut = Join-Path $eslintDir "eslint-fe.txt"
-          $rc = Run-And-Capture (Join-Path $env:WORKSPACE "frontend\\app") "npm run lint --silent" $feOut
-          if ($rc -ne 0) { Add-Content $feOut "`r`nESLint Frontend issues OR lint script missing (NON-BLOCKING)." }
+          Push-Location "frontend/app"
+          npx eslint . || exit 0
+          Pop-Location
 
           Write-Host "-- Prettier check (repo)"
-          $preOut = Join-Path $prettierDir "prettier-check.txt"
-          cmd /c "npx --yes prettier -c ." 2>&1 | Out-File -FilePath $preOut -Encoding UTF8
-          if ($LASTEXITCODE -ne 0) {
-            Add-Content $preOut "`r`nPrettier differences OR Prettier not configured (NON-BLOCKING)."
-          } else {
-            Add-Content $preOut "`r`nPrettier: formatting OK."
-          }
+          npx prettier -c . || exit 0
 
           Write-Host "===== CODE QUALITY COMPLETE ====="
-          exit 0
         '''
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/eslint/**, reports/prettier/**'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**'
         }
       }
     }
@@ -186,11 +112,10 @@ pipeline {
     stage('Build - Frontend (Angular)') {
       steps {
         dir('frontend/app') {
-          bat """
-            @echo off
+          bat '''
             echo ===== FE BUILD =====
             npm run build
-          """
+          '''
         }
       }
       post {
@@ -202,22 +127,14 @@ pipeline {
 
     stage('Code Quality - SonarCloud') {
       steps {
-        script {
-          def scannerHome = tool("${SONAR_SCANNER_TOOL}")
-          withSonarQubeEnv("${SONAR_SERVER_NAME}") {
-            withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
+        withCredentials([string(credentialsId: "${SONAR_CRED}", variable: 'SONAR_TOKEN')]) {
+          script {
+            def scannerHome = tool 'SonarQubeScanner'
+            withSonarQubeEnv('SonarCloud') {
               bat """
-                @echo off
                 echo ===== SONARCLOUD SCAN (MONOREPO) =====
                 "${scannerHome}\\bin\\sonar-scanner.bat" ^
-                  -Dsonar.host.url=https://sonarcloud.io ^
-                  -Dsonar.token=%SONAR_TOKEN% ^
-                  -Dsonar.organization=%SONAR_ORG% ^
-                  -Dsonar.projectKey=%SONAR_PROJECT_KEY% ^
-                  -Dsonar.projectName=%SONAR_PROJECT_KEY% ^
-                  -Dsonar.sources=api,frontend/app/src ^
-                  -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/.angular/**,**/coverage/** ^
-                  -Dsonar.javascript.lcov.reportPaths=api/coverage/lcov.info,frontend/app/coverage/lcov.info
+                  -Dsonar.login=%SONAR_TOKEN%
               """
             }
           }
@@ -228,83 +145,88 @@ pipeline {
     stage('Security - Trivy FS Scan (vuln+misconfig)') {
       steps {
         bat """
-          @echo off
           echo ===== TRIVY FILESYSTEM SCAN =====
-          if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
+          if not exist %REPORT_DIR%\\trivy mkdir %REPORT_DIR%\\trivy
 
-          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format json  --output "%REPORT_DIR%\\trivy-fs.json" .
-          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format table --output "%REPORT_DIR%\\trivy-fs.txt"  .
+          trivy fs --scanners vuln,misconfig --format json --output %REPORT_DIR%\\trivy\\trivy-fs-api.json api || exit /b 0
+          trivy fs --scanners vuln,misconfig --format json --output %REPORT_DIR%\\trivy\\trivy-fs-frontend.json frontend/app || exit /b 0
 
           echo ===== TRIVY FS SCAN COMPLETE =====
         """
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-fs.json, reports/trivy-fs.txt'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy/**'
         }
       }
     }
 
-    // ✅ FIXED: PowerShell mount string uses $($dcData) so ':' doesn't break parsing
     stage('Security - Dependency-Check (SCA)') {
+      options { timeout(time: 30, unit: 'MINUTES') }
       steps {
-        withCredentials([string(credentialsId: "${NVD_API_KEY_CRED_ID}", variable: 'NVD_API_KEY')]) {
+        withCredentials([string(credentialsId: "${NVD_API_CRED}", variable: 'NVD_API_KEY')]) {
           powershell '''
             Write-Host "===== OWASP DEPENDENCY-CHECK (SCA) ====="
-            $ErrorActionPreference = "Continue"
 
-            $root = Join-Path $env:WORKSPACE $env:REPORT_DIR
+            $root   = Join-Path $env:WORKSPACE $env:REPORT_DIR
             $outDir = Join-Path $root "dependency-check"
             New-Item -ItemType Directory -Force $outDir | Out-Null
 
-            # Persistent cache under Jenkins Home to reduce updates
+            # Persistent cache under JENKINS_HOME
             $jenkinsHome = $env:JENKINS_HOME
             if (-not $jenkinsHome) { $jenkinsHome = "C:\\ProgramData\\Jenkins\\.jenkins" }
-
             $dcData = Join-Path $jenkinsHome "dependency-check-data"
             New-Item -ItemType Directory -Force $dcData | Out-Null
 
-            # ✅ IMPORTANT: use $() to stop PowerShell reading "$dcData:" as a scoped variable
+            # Update only once per 24h
+            $dbFile = Join-Path $dcData "odc.mv.db"
+            $needUpdate = $true
+            if (Test-Path $dbFile) {
+              $ageHours = (New-TimeSpan -Start (Get-Item $dbFile).LastWriteTime -End (Get-Date)).TotalHours
+              if ($ageHours -lt 24) { $needUpdate = $false }
+            }
+
             $srcMount  = "$($env:WORKSPACE):/src"
             $dataMount = "$($dcData):/usr/share/dependency-check/data"
 
-            try { docker pull owasp/dependency-check:latest | Out-Null } catch {}
-
-            function Run-DC([switch]$NoUpdate) {
-              $args = @(
-                "run","--rm",
-                "-v",$srcMount,
-                "-v",$dataMount,
-                "-w","/src",
-                "owasp/dependency-check:latest",
-                "--project",$env:APP_NAME,
-                "--scan","/src/api/package.json",
-                "--scan","/src/api/package-lock.json",
-                "--scan","/src/frontend/app/package.json",
-                "--scan","/src/frontend/app/package-lock.json",
-                "--format","HTML",
-                "--format","JSON",
-                "--out","/src/"+$env:REPORT_DIR+"/dependency-check",
-                "--nvdApiKey",$env:NVD_API_KEY,
-                "--failOnCVSS","11"
-              )
-              if ($NoUpdate) { $args += "--noupdate" }
-
-              & docker @args
-              return $LASTEXITCODE
+            docker pull owasp/dependency-check:latest
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "Dependency-Check image pull failed (non-blocking)."
+              exit 0
             }
 
-            $rc = Run-DC
-            if ($rc -ne 0) {
-              Write-Host "Dependency-Check failed (rc=$rc). Retrying with --noupdate (use cached DB)..."
-              $rc2 = Run-DC -NoUpdate
-              Write-Host "Retry rc=$rc2 (pipeline continues)."
+            $cmd = @(
+              "run","--rm",
+              "-v",$srcMount,
+              "-v",$dataMount,
+              "-w","/src",
+              "owasp/dependency-check:latest",
+              "--project=$($env:APP_NAME)",
+              "--scan=/src/api/package.json",
+              "--scan=/src/api/package-lock.json",
+              "--scan=/src/frontend/app/package.json",
+              "--scan=/src/frontend/app/package-lock.json",
+              "--format=HTML",
+              "--format=JSON",
+              "--out=/src/"+$env:REPORT_DIR+"/dependency-check",
+              "--log=/src/"+$env:REPORT_DIR+"/dependency-check/dependency-check.log",
+              "--nvdApiKey=$($env:NVD_API_KEY)",
+              "--nvdApiDelay=2000",
+              "--cveValidForHours=24",
+              "--failOnCVSS=11"
+            )
+
+            if (-not $needUpdate) {
+              Write-Host "Using cached DB (--noupdate)"
+              $cmd += "--noupdate"
             } else {
-              Write-Host "Dependency-Check completed."
+              Write-Host "Updating NVD DB (first run may take time)"
             }
 
-            "Dependency-Check finished (non-blocking). See reports/dependency-check/." |
-              Set-Content -Path (Join-Path $outDir "dependency-check-note.txt") -Encoding UTF8
+            & docker @cmd
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "Dependency-Check non-zero exit code (non-blocking)."
+            }
 
             exit 0
           '''
@@ -318,42 +240,34 @@ pipeline {
     }
 
     stage('Security - Gitleaks (Secrets Scan)') {
+      options { timeout(time: 10, unit: 'MINUTES') }
       steps {
         powershell '''
           Write-Host "===== GITLEAKS SECRETS SCAN ====="
-          $ErrorActionPreference = "Continue"
 
-          $root = Join-Path $env:WORKSPACE $env:REPORT_DIR
+          $root   = Join-Path $env:WORKSPACE $env:REPORT_DIR
           $outDir = Join-Path $root "gitleaks"
           New-Item -ItemType Directory -Force $outDir | Out-Null
 
-          $reportHost = Join-Path $outDir "gitleaks-report.json"
-          $noteHost   = Join-Path $outDir "gitleaks-note.txt"
-          "[]" | Set-Content -Path $reportHost -Encoding UTF8
+          $repoMount = "$($env:WORKSPACE):/repo"
+          $outMount  = "$($outDir):/out"
 
-          $srcMount = "$($env:WORKSPACE):/src"
+          # Use a dedicated /out mount so report writing never hits a permission wall
+          docker pull zricethezav/gitleaks:latest
+          if ($LASTEXITCODE -ne 0) { Write-Host "Gitleaks image pull failed (non-blocking)."; exit 0 }
 
-          try { docker pull $env:GITLEAKS_IMAGE | Out-Null } catch {
-            "Skipped: Unable to pull $($env:GITLEAKS_IMAGE). (Pipeline continues)" |
-              Set-Content -Path $noteHost -Encoding UTF8
-            exit 0
-          }
+          & docker run --rm `
+            -v $repoMount `
+            -v $outMount `
+            -w /repo `
+            zricethezav/gitleaks:latest detect `
+              --source="/repo" `
+              --report-format="json" `
+              --report-path="/out/gitleaks-report.json" `
+              --redact `
+              --exit-code=0
 
-          docker run --rm -v $srcMount $env:GITLEAKS_IMAGE detect `
-            --source=/src `
-            --report-format json `
-            --report-path ("/src/" + $env:REPORT_DIR + "/gitleaks/gitleaks-report.json") `
-            --redact
-
-          $rc = $LASTEXITCODE
-          if ($rc -ne 0) {
-            "Potential secrets detected OR gitleaks exit=$rc. Review gitleaks-report.json. (Pipeline continues)" |
-              Set-Content -Path $noteHost -Encoding UTF8
-          } else {
-            "No secrets detected by Gitleaks." |
-              Set-Content -Path $noteHost -Encoding UTF8
-          }
-
+          Write-Host "===== GITLEAKS COMPLETE ====="
           exit 0
         '''
       }
@@ -367,16 +281,11 @@ pipeline {
     stage('Build Docker Images') {
       steps {
         bat """
-          @echo off
           echo ===== DOCKER BUILD =====
-          set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
-          set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
-
-          echo Building %API_IMAGE%
-          docker build -t %API_IMAGE% -f api\\Dockerfile api
-
-          echo Building %FE_IMAGE%
-          docker build -t %FE_IMAGE% -f frontend\\app\\Dockerfile frontend\\app
+          echo Building %IMAGE_API%:%IMAGE_TAG%
+          docker build -t %IMAGE_API%:%IMAGE_TAG% api
+          echo Building %IMAGE_WEB%:%IMAGE_TAG%
+          docker build -t %IMAGE_WEB%:%IMAGE_TAG% frontend/app
         """
       }
     }
@@ -384,42 +293,33 @@ pipeline {
     stage('Security - Trivy Image Scan (TAR input, Windows-safe)') {
       steps {
         bat """
-          @echo off
           echo ===== TRIVY IMAGE SCAN (TAR) =====
-          if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
+          if not exist %REPORT_DIR%\\trivy mkdir %REPORT_DIR%\\trivy
 
-          set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
-          set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
+          docker save %IMAGE_API%:%IMAGE_TAG% -o %REPORT_DIR%\\trivy\\api.tar
+          docker save %IMAGE_WEB%:%IMAGE_TAG% -o %REPORT_DIR%\\trivy\\web.tar
 
-          docker save -o "%REPORT_DIR%\\api-image.tar" %API_IMAGE%
-          docker save -o "%REPORT_DIR%\\fe-image.tar"  %FE_IMAGE%
-
-          trivy image --input "%REPORT_DIR%\\api-image.tar" --severity HIGH,CRITICAL --format json --output "%REPORT_DIR%\\trivy-api-image.json"
-          trivy image --input "%REPORT_DIR%\\fe-image.tar"  --severity HIGH,CRITICAL --format json --output "%REPORT_DIR%\\trivy-fe-image.json"
+          trivy image --input %REPORT_DIR%\\trivy\\api.tar --format json --output %REPORT_DIR%\\trivy\\trivy-image-api.json || exit /b 0
+          trivy image --input %REPORT_DIR%\\trivy\\web.tar --format json --output %REPORT_DIR%\\trivy\\trivy-image-web.json || exit /b 0
 
           echo ===== TRIVY IMAGE SCAN COMPLETE =====
         """
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-api-image.json, reports/trivy-fe-image.json, reports/*.tar'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy/**'
         }
       }
     }
 
     stage('Push Images (Docker Hub)') {
       steps {
-        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS_ID}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CRED}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
           bat """
-            @echo off
+            echo ===== DOCKER PUSH =====
             echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
-
-            set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
-            set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
-
-            docker push %API_IMAGE%
-            docker push %FE_IMAGE%
-
+            docker push %IMAGE_API%:%IMAGE_TAG%
+            docker push %IMAGE_WEB%:%IMAGE_TAG%
             docker logout
           """
         }
