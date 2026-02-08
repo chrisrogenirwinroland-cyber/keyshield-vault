@@ -675,82 +675,121 @@ Grafana:    $env:GRAFANA_URL
     }
   } // نهاية stages
 
-  post {
-    always {
-      bat """
-        echo ===== POST: DOCKER PS =====
-        docker ps
+// ✅ REPLACE your entire:  post { ... }  block with THIS one
+post {
+  always {
+    bat """
+      echo ===== POST: DOCKER PS =====
+      docker ps
 
-        echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
-        docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
-      """
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
-    }
+      echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
+      docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
+    """
+    archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
+  }
 
-    success {
-      script {
-        def readSafe = { p, fb -> fileExists(p) ? readFile(p) : fb }
-        def clip = { s, n ->
-          def x = (s ?: '')
-          return (x.length() > n) ? (x.substring(0, n) + "\n...[clipped]...") : x
-        }
-        def esc = { s ->
-          (s ?: '')
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-        }
+  success {
+    script {
+      // ---------- Safe file read ----------
+      def readSafe = { p, fb -> fileExists(p) ? readFile(p) : fb }
 
-        def buildSum   = readSafe('reports/build-summary.txt', 'No build-summary.txt generated.')
-        def vulnSummary= readSafe('reports/vuln-summary.txt',  'No vuln-summary.txt generated.')
-        def smoke      = readSafe('reports/smoke-test.txt',    'No smoke-test.txt generated.')
-        def monitorVal = readSafe('reports/alerts-validation.txt','No alerts-validation.txt generated.')
+      // ---------- Clip long outputs ----------
+      def clip = { s, n ->
+        def x = (s ?: '')
+        (x.length() > n) ? (x.substring(0, n) + "\n...[clipped]...") : x
+      }
 
-        // Code quality outputs
-        def eslintApi  = readSafe('reports/eslint/eslint-api.txt', 'No ESLint API output.')
-        def eslintFe   = readSafe('reports/eslint/eslint-fe.txt',  'No ESLint Frontend output.')
-        def prettier   = readSafe('reports/prettier/prettier-check.txt', 'No Prettier output.')
+      // ---------- Remove BOM + ANSI (fix ï»¿ and "encrypted" [33m codes) ----------
+      def deBom = { s ->
+        (s ?: '')
+          .replace('\uFEFF', '')  // real BOM char
+          .replace('ï»¿', '')      // BOM rendered as mojibake
+      }
 
-        // Dependency-Check note (and full reports are attached)
-        def dcNote     = readSafe('reports/dependency-check/dependency-check-note.txt',
-                                  'No dependency-check-note.txt (see reports/dependency-check/).')
+      def stripAnsi = { s ->
+        def x = (s ?: '')
+        // CSI escape sequences
+        x = x.replaceAll(/\u001B\[[0-9;?]*[ -\/]*[@-~]/, '')
+        // Single-character CSI (rare)
+        x = x.replaceAll(/\u009B[0-9;?]*[ -\/]*[@-~]/, '')
+        return x
+      }
 
-        def attachments = [
-          'reports/build-summary.txt',
-          'reports/vuln-summary.txt',
-          'reports/trivy-fs.txt',
-          'reports/trivy-fs.json',
-          'reports/trivy-api-image.json',
-          'reports/trivy-fe-image.json',
-          'reports/smoke-test.txt',
-          'reports/alerts-validation.txt',
-          'reports/monitoring-note.txt',
-          'reports/monitoring-ps.txt',
-          'reports/eslint/**',
-          'reports/prettier/**',
-          'reports/dependency-check/**'
-        ].join(',')
+      def clean = { s -> stripAnsi(deBom(s)) }
 
-        emailext(
-          to: "${ALERT_TO}",
-          subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-          mimeType: 'text/html; charset=UTF-8',
-          attachmentsPattern: attachments,
-          body: """
+      // ---------- HTML escape (after cleaning) ----------
+      def esc = { s ->
+        (s ?: '')
+          .replace("&", "&amp;")
+          .replace("<", "&lt;")
+          .replace(">", "&gt;")
+      }
+
+      // ---------- Load report snippets ----------
+      def buildSum    = clean(readSafe('reports/build-summary.txt', 'No build-summary.txt generated.'))
+      def vulnSummary = clean(readSafe('reports/vuln-summary.txt',  'No vuln-summary.txt generated.'))
+      def smoke       = clean(readSafe('reports/smoke-test.txt',    'No smoke-test.txt generated.'))
+      def monitorVal  = clean(readSafe('reports/alerts-validation.txt', 'No alerts-validation.txt generated.'))
+
+      def eslintApi   = clean(readSafe('reports/eslint/eslint-api.txt', 'No ESLint API output.'))
+      def eslintFe    = clean(readSafe('reports/eslint/eslint-fe.txt',  'No ESLint Frontend output.'))
+      def prettier    = clean(readSafe('reports/prettier/prettier-check.txt', 'No Prettier output.'))
+
+      def dcNote      = clean(readSafe('reports/dependency-check/dependency-check-note.txt',
+                                       'No dependency-check-note.txt (see reports/dependency-check/).'))
+
+      // ---------- Keep attachments (but REMOVE the "Attachments included" section from email body) ----------
+      def attachments = [
+        'reports/build-summary.txt',
+        'reports/vuln-summary.txt',
+        'reports/trivy-fs.txt',
+        'reports/trivy-fs.json',
+        'reports/trivy-api-image.json',
+        'reports/trivy-fe-image.json',
+        'reports/smoke-test.txt',
+        'reports/alerts-validation.txt',
+        'reports/monitoring-note.txt',
+        'reports/monitoring-ps.txt',
+        'reports/eslint/**',
+        'reports/prettier/**',
+        'reports/dependency-check/**'
+      ].join(',')
+
+      emailext(
+        to: "${ALERT_TO}",
+        subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+        mimeType: 'text/html; charset=UTF-8',
+        attachmentsPattern: attachments,
+        body: """
 <!doctype html>
 <html>
 <head><meta charset="UTF-8"></head>
-<body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
+<body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222; line-height:1.35;">
 
-  <h2 style="margin:0 0 10px 0;">
-    CI/CD Pipeline Result: <span style="color:#1a7f37; font-weight:700;">SUCCESS</span>
-  </h2>
+  <div style="margin-bottom:10px;">
+    <h2 style="margin:0 0 8px 0;">
+      CI/CD Pipeline Result:
+      <span style="color:#1a7f37; font-weight:700;">SUCCESS</span>
+    </h2>
+  </div>
 
-  <table cellpadding="8" cellspacing="0" style="border-collapse:collapse; border:1px solid #ddd;">
-    <tr><td style="border:1px solid #ddd;"><b>Job</b></td><td style="border:1px solid #ddd;">${JOB_NAME}</td></tr>
-    <tr><td style="border:1px solid #ddd;"><b>Build</b></td><td style="border:1px solid #ddd;">#${BUILD_NUMBER}</td></tr>
-    <tr><td style="border:1px solid #ddd;"><b>Commit</b></td><td style="border:1px solid #ddd;">${GIT_SHA}</td></tr>
-    <tr><td style="border:1px solid #ddd;"><b>Build URL</b></td><td style="border:1px solid #ddd;"><a href="${BUILD_URL}">${BUILD_URL}</a></td></tr>
+  <table cellpadding="8" cellspacing="0" style="border-collapse:collapse; border:1px solid #ddd; width:100%; max-width:820px;">
+    <tr>
+      <td style="border:1px solid #ddd; width:140px;"><b>Job</b></td>
+      <td style="border:1px solid #ddd;">${JOB_NAME}</td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #ddd;"><b>Build</b></td>
+      <td style="border:1px solid #ddd;">#${BUILD_NUMBER}</td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #ddd;"><b>Commit</b></td>
+      <td style="border:1px solid #ddd;">${GIT_SHA}</td>
+    </tr>
+    <tr>
+      <td style="border:1px solid #ddd;"><b>Build URL</b></td>
+      <td style="border:1px solid #ddd;"><a href="${BUILD_URL}">${BUILD_URL}</a></td>
+    </tr>
     <tr>
       <td style="border:1px solid #ddd;"><b>SonarCloud</b></td>
       <td style="border:1px solid #ddd;">
@@ -759,10 +798,11 @@ Grafana:    $env:GRAFANA_URL
     </tr>
   </table>
 
-  <h3 style="margin:14px 0 8px 0;">Build Summary</h3>
+  <h3 style="margin:16px 0 8px 0;">Build Summary</h3>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(buildSum)}</pre>
 
-  <h3 style="margin:14px 0 8px 0;">Code Quality (ESLint / Prettier)</h3>
+  <h3 style="margin:16px 0 8px 0;">Code Quality (ESLint / Prettier)</h3>
+
   <p style="margin:0 0 6px 0;"><b>ESLint (API)</b></p>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(eslintApi, 2500))}</pre>
 
@@ -770,25 +810,19 @@ Grafana:    $env:GRAFANA_URL
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(eslintFe, 2500))}</pre>
 
   <p style="margin:0 0 6px 0;"><b>Prettier Check</b></p>
-  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(prettier, 2000))}</pre>
+  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(prettier, 2200))}</pre>
 
-  <h3 style="margin:14px 0 8px 0;">Security (Trivy)</h3>
+  <h3 style="margin:16px 0 8px 0;">Security (Trivy)</h3>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(vulnSummary)}</pre>
 
-  <h3 style="margin:14px 0 8px 0;">SCA (Dependency-Check)</h3>
+  <h3 style="margin:16px 0 8px 0;">SCA (Dependency-Check)</h3>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(dcNote, 1200))}</pre>
 
-  <h3 style="margin:14px 0 8px 0;">Release Smoke Test</h3>
+  <h3 style="margin:16px 0 8px 0;">Release Smoke Test</h3>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(smoke)}</pre>
 
-  <h3 style="margin:14px 0 8px 0;">Monitoring / Alerts Validation</h3>
+  <h3 style="margin:16px 0 8px 0;">Monitoring / Alerts Validation</h3>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(monitorVal)}</pre>
-
-  <p style="margin-top:12px;">
-    <b>Attachments included:</b>
-    build-summary, vuln-summary, Trivy (txt/json), smoke-test, alerts-validation,
-    ESLint/Prettier outputs, dependency-check reports, monitoring notes.
-  </p>
 
   <p style="color:#666; margin-top:16px;">
     Regards,<br/>
@@ -799,35 +833,41 @@ Grafana:    $env:GRAFANA_URL
 </body>
 </html>
 """
-        )
-      }
+      )
     }
+  }
 
-    failure {
-      emailext(
-        to: "${ALERT_TO}",
-        subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-        mimeType: 'text/html; charset=UTF-8',
-        attachmentsPattern: 'reports/**',
-        attachLog: true,
-        body: """
+  failure {
+    emailext(
+      to: "${ALERT_TO}",
+      subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+      mimeType: 'text/html; charset=UTF-8',
+      attachmentsPattern: 'reports/**',
+      attachLog: true,
+      body: """
 <!doctype html>
 <html>
 <head><meta charset="UTF-8"></head>
-<body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
-  <h2 style="margin:0 0 10px 0;">CI/CD Pipeline Result: <span style="color:#b42318; font-weight:700;">FAILED</span></h2>
-  <p>
+<body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222; line-height:1.35;">
+  <h2 style="margin:0 0 10px 0;">
+    CI/CD Pipeline Result:
+    <span style="color:#b42318; font-weight:700;">FAILED</span>
+  </h2>
+  <p style="margin:0 0 10px 0;">
     <b>Job:</b> ${JOB_NAME}<br/>
     <b>Build:</b> #${BUILD_NUMBER}<br/>
     <b>Commit:</b> ${GIT_SHA}<br/>
     <b>Build URL:</b> <a href="${BUILD_URL}">${BUILD_URL}</a>
   </p>
-  <p>Console log attached. Any generated reports are attached/archived under Jenkins artifacts.</p>
-  <p style="color:#666; margin-top:16px;">Regards,<br/>Jenkins CI/CD Pipeline<br/>${APP_NAME}</p>
+  <p style="margin:0 0 10px 0;">Console log attached. Any generated reports are attached/archived under Jenkins artifacts.</p>
+  <p style="color:#666; margin-top:16px;">
+    Regards,<br/>
+    Jenkins CI/CD Pipeline<br/>
+    ${APP_NAME}
+  </p>
 </body>
 </html>
 """
-      )
-    }
-  } // نهاية post
-} // نهاية pipeline
+    )
+  }
+}
