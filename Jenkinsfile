@@ -843,163 +843,147 @@ Grafana:    $env:GRAFANA_URL
     }
   }
 
-  post {
-    always {
-      bat """
-        echo ===== POST: DOCKER PS =====
-        docker ps
+post {
+  always {
+    bat """
+      echo ===== POST: DOCKER PS =====
+      docker ps
 
-        echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
-        docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
-      """
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
-    }
+      echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
+      docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
+    """
+    archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
+  }
 
-    success {
-      script {
-        // Read summaries (if present) to embed in email
-        def readSafe = { p, fallback ->
-          return fileExists(p) ? readFile(p) : fallback
-        }
+  success {
+    script {
+      // --- helpers ---
+      def readSafe = { p, fb -> fileExists(p) ? readFile(p) : fb }
+      def clip = { s, n ->
+        def x = (s ?: '')
+        return (x.length() > n) ? (x.substring(0, n) + "\n...[clipped]...") : x
+      }
+      def esc = { s ->
+        (s ?: '')
+          .replace("&", "&amp;")
+          .replace("<", "&lt;")
+          .replace(">", "&gt;")
+      }
 
-        def buildSummary = readSafe('reports/build-summary.txt', 'No build-summary.txt generated.')
-        def smoke       = readSafe('reports/smoke-test.txt', 'No smoke-test.txt generated.')
-        def monitorVal  = readSafe('reports/alerts-validation.txt', 'No alerts-validation.txt generated.')
-        def vulnSummary = readSafe('reports/vuln-summary.txt', 'No vuln-summary.txt generated.')
-        def vulnTop     = readSafe('reports/vuln-top-findings.txt', 'No vuln-top-findings.txt generated.')
-        def sonarSum    = readSafe('reports/sonar-summary.txt', 'No sonar-summary.txt generated.')
-        def lintSum     = readSafe('reports/lint-summary.txt', 'No lint-summary.txt generated.')
-        def dcSum       = readSafe('reports/dc-summary.txt', 'No dc-summary.txt generated.')
+      // --- existing reports you already generate ---
+      def vulnSummary = readSafe('reports/vuln-summary.txt', 'No vuln-summary.txt generated.')
+      def smoke      = readSafe('reports/smoke-test.txt', 'No smoke-test.txt generated.')
+      def monitorVal = readSafe('reports/alerts-validation.txt', 'No alerts-validation.txt generated.')
+      def buildSum   = readSafe('reports/build-summary.txt', 'No build-summary.txt generated.')
 
-        def sonarLine = readSafe('reports/sonar-summary-line.txt', 'QG=UNKNOWN')
-        def trivyLine = readSafe('reports/trivy-summary-line.txt', 'Trivy HIGH=n/a | CRITICAL=n/a')
-        def dcLine    = readSafe('reports/dc-summary-line.txt', 'DC Total=n/a')
+      // --- NEW: code-quality stage outputs (non-blocking summaries) ---
+      def eslintApi  = readSafe('reports/eslint/eslint-api.txt', 'No ESLint API output (file missing).')
+      def eslintFe   = readSafe('reports/eslint/eslint-fe.txt',  'No ESLint Frontend output (file missing).')
+      def prettier   = readSafe('reports/prettier/prettier-check.txt', 'No Prettier output (file missing).')
 
-        env.SONAR_METRICS_LINE = sonarLine.trim()
-        env.TRIVY_TOTALS_LINE  = trivyLine.trim()
-        env.DC_SUMMARY_LINE    = dcLine.trim()
+      // --- NEW: dependency-check stage output ---
+      def dcNote = readSafe('reports/dependency-check/dependency-check-note.txt',
+                            'No dependency-check-note.txt (check reports/dependency-check/).')
 
-        // Simple HTML escape
-        def esc = { s ->
-          (s ?: '')
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-        }
+      emailext(
+        to: "${ALERT_TO}",
+        subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+        mimeType: 'text/html; charset=UTF-8',
 
-        // IMPORTANT: No emojis. Force UTF-8.
-        emailext(
-          to: "${ALERT_TO}",
-          subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-          mimeType: 'text/html; charset=UTF-8',
-          attachmentsPattern: '''
-reports/build-summary.txt,
-reports/sonar-summary.txt,
-reports/sonar-summary-line.txt,
-reports/lint-summary.txt,
-reports/vuln-summary.txt,
-reports/vuln-top-findings.txt,
-reports/trivy-summary-line.txt,
-reports/trivy-fs.txt,
-reports/trivy-fs.json,
-reports/trivy-api-image.json,
-reports/trivy-fe-image.json,
-reports/dc-summary.txt,
-reports/dc-summary-line.txt,
-reports/dependency-check/**,
-reports/smoke-test.txt,
-reports/alerts-validation.txt,
-reports/monitoring-note.txt,
-reports/monitoring-ps.txt
-'''.trim().replaceAll("\\s+", ""),
-          body: """
+        // ✅ UPDATED: include new stage folders (eslint/prettier/dependency-check)
+        attachmentsPattern: [
+          'reports/build-summary.txt',
+          'reports/vuln-summary.txt',
+          'reports/trivy-fs.txt',
+          'reports/trivy-fs.json',
+          'reports/trivy-api-image.json',
+          'reports/trivy-fe-image.json',
+          'reports/smoke-test.txt',
+          'reports/alerts-validation.txt',
+          'reports/monitoring-note.txt',
+          'reports/monitoring-ps.txt',
+          'reports/eslint/**',
+          'reports/prettier/**',
+          'reports/dependency-check/**'
+        ].join(','),
+
+        body: """
 <!doctype html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <style>
-    body { font-family: Segoe UI, Arial, sans-serif; font-size: 14px; color: #222; }
-    .ok { color: #1a7f37; font-weight: 700; }
-    table { border-collapse: collapse; border: 1px solid #ddd; }
-    td { border: 1px solid #ddd; padding: 8px; }
-    pre { background: #f6f8fa; padding: 10px; border: 1px solid #ddd; white-space: pre-wrap; }
-    .muted { color: #666; }
-  </style>
 </head>
-<body>
+<body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
 
-<h2 style="margin:0 0 10px 0;">
-  CI/CD Pipeline Result: <span class="ok">SUCCESS</span>
-</h2>
+  <h2 style="margin:0 0 10px 0;">
+    CI/CD Pipeline Result: <span style="color:#1a7f37; font-weight:700;">SUCCESS</span>
+  </h2>
 
-<table cellpadding="0" cellspacing="0">
-  <tr><td><b>Job</b></td><td>${JOB_NAME}</td></tr>
-  <tr><td><b>Build</b></td><td>#${BUILD_NUMBER}</td></tr>
-  <tr><td><b>Branch</b></td><td>${GIT_BRANCH}</td></tr>
-  <tr><td><b>Commit</b></td><td>${GIT_SHA}</td></tr>
-  <tr><td><b>Build URL</b></td><td><a href="${BUILD_URL}">${BUILD_URL}</a></td></tr>
-  <tr><td><b>SonarCloud</b></td>
-      <td><a href="https://sonarcloud.io/dashboard?id=${SONAR_PROJECT_KEY}">Open dashboard</a></td>
-  </tr>
-</table>
+  <table cellpadding="8" cellspacing="0" style="border-collapse:collapse; border:1px solid #ddd;">
+    <tr><td style="border:1px solid #ddd;"><b>Job</b></td><td style="border:1px solid #ddd;">${JOB_NAME}</td></tr>
+    <tr><td style="border:1px solid #ddd;"><b>Build</b></td><td style="border:1px solid #ddd;">#${BUILD_NUMBER}</td></tr>
+    <tr><td style="border:1px solid #ddd;"><b>Commit</b></td><td style="border:1px solid #ddd;">${GIT_SHA}</td></tr>
+    <tr><td style="border:1px solid #ddd;"><b>Build URL</b></td><td style="border:1px solid #ddd;"><a href="${BUILD_URL}">${BUILD_URL}</a></td></tr>
+    <tr>
+      <td style="border:1px solid #ddd;"><b>SonarCloud</b></td>
+      <td style="border:1px solid #ddd;">
+        <a href="https://sonarcloud.io/dashboard?id=${SONAR_PROJECT_KEY}">Open SonarCloud dashboard</a>
+      </td>
+    </tr>
+  </table>
 
-<p style="margin:12px 0 0 0;">
-  <b>Headlines:</b><br/>
-  Sonar: ${esc(env.SONAR_METRICS_LINE)}<br/>
-  Trivy: ${esc(env.TRIVY_TOTALS_LINE)}<br/>
-  Dependency-Check: ${esc(env.DC_SUMMARY_LINE)}
-</p>
+  <h3 style="margin:14px 0 8px 0;">Build Summary</h3>
+  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(buildSum)}</pre>
 
-<h3 style="margin:14px 0 8px 0;">Build Summary</h3>
-<pre>${esc(buildSummary)}</pre>
+  <h3 style="margin:14px 0 8px 0;">Code Quality Summary (ESLint / Prettier)</h3>
+  <p style="margin:0 0 6px 0;"><b>ESLint (API)</b></p>
+  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(eslintApi, 2500))}</pre>
 
-<h3 style="margin:14px 0 8px 0;">Code Quality (SonarCloud)</h3>
-<pre>${esc(sonarSum)}</pre>
+  <p style="margin:0 0 6px 0;"><b>ESLint (Frontend)</b></p>
+  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(eslintFe, 2500))}</pre>
 
-<h3 style="margin:14px 0 8px 0;">Code Quality (ESLint / Prettier)</h3>
-<pre>${esc(lintSum)}</pre>
+  <p style="margin:0 0 6px 0;"><b>Prettier Check</b></p>
+  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(prettier, 2000))}</pre>
 
-<h3 style="margin:14px 0 8px 0;">Security Summary (Trivy)</h3>
-<pre>${esc(vulnSummary)}</pre>
+  <h3 style="margin:14px 0 8px 0;">Security Summary (Trivy)</h3>
+  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(vulnSummary)}</pre>
 
-<h3 style="margin:14px 0 8px 0;">Top Vulnerability Findings (Trivy)</h3>
-<pre>${esc(vulnTop)}</pre>
+  <h3 style="margin:14px 0 8px 0;">SCA Summary (Dependency-Check)</h3>
+  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(dcNote, 1200))}</pre>
 
-<h3 style="margin:14px 0 8px 0;">SCA Summary (Dependency-Check)</h3>
-<pre>${esc(dcSum)}</pre>
+  <h3 style="margin:14px 0 8px 0;">Release Smoke Test</h3>
+  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(smoke)}</pre>
 
-<h3 style="margin:14px 0 8px 0;">Release Smoke Test</h3>
-<pre>${esc(smoke)}</pre>
+  <h3 style="margin:14px 0 8px 0;">Monitoring / Alerts Validation</h3>
+  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(monitorVal)}</pre>
 
-<h3 style="margin:14px 0 8px 0;">Monitoring / Alerts Validation</h3>
-<pre>${esc(monitorVal)}</pre>
+  <p style="margin-top:12px;">
+    <b>Attachments included:</b>
+    build-summary, vuln-summary, Trivy outputs (txt/json), smoke-test, alerts-validation,
+    ESLint/Prettier outputs, dependency-check reports, monitoring notes.
+  </p>
 
-<p class="muted" style="margin-top:12px;">
-  Attachments included: build summary, Sonar summary, lint outputs, Trivy reports (txt/json), Dependency-Check reports, smoke test, monitoring validation.
-</p>
-
-<p class="muted" style="margin-top:16px;">
-  Regards,<br/>
-  Jenkins CI/CD Pipeline<br/>
-  ${APP_NAME}
-</p>
+  <p style="color:#666; margin-top:16px;">
+    Regards,<br/>
+    Jenkins CI/CD Pipeline<br/>
+    ${APP_NAME}
+  </p>
 
 </body>
 </html>
 """
-        )
-      }
+      )
     }
+  }
 
-    failure {
-      // Keep failure email simple + UTF-8 + attach log and reports
-      emailext(
-        to: "${ALERT_TO}",
-        subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-        mimeType: 'text/html; charset=UTF-8',
-        attachmentsPattern: 'reports/**',
-        attachLog: true,
-        body: """
+  failure {
+    emailext(
+      to: "${ALERT_TO}",
+      subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+      mimeType: 'text/html; charset=UTF-8',
+      attachmentsPattern: 'reports/**',
+      attachLog: true,
+      body: """
 <!doctype html>
 <html>
 <head><meta charset="UTF-8"></head>
@@ -1008,16 +992,14 @@ reports/monitoring-ps.txt
   <p>
     <b>Job:</b> ${JOB_NAME}<br/>
     <b>Build:</b> #${BUILD_NUMBER}<br/>
-    <b>Branch:</b> ${GIT_BRANCH}<br/>
     <b>Commit:</b> ${GIT_SHA}<br/>
     <b>Build URL:</b> <a href="${BUILD_URL}">${BUILD_URL}</a>
   </p>
-  <p>Console log is attached. Any generated reports are attached/archived under Jenkins artifacts.</p>
+  <p>Console log attached. Any generated reports are attached/archived under Jenkins artifacts.</p>
   <p style="color:#666; margin-top:16px;">Regards,<br/>Jenkins CI/CD Pipeline<br/>${APP_NAME}</p>
 </body>
 </html>
 """
-      )
-    }
+    )
   }
 }
