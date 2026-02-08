@@ -1,0 +1,16 @@
+# New Relic Infrastructure agent config
+
+# Paste your NEW Relic "INGEST - LICENSE" key here (rotate the old one if you posted it)
+license_key: "B52900B03345D265E0E94BB886DE0ED14EB139F9764C24A064D4FD9A148B025D"
+
+display_name: "keyshield-docker-host"
+collector: https://infra-api.eu.newrelic.com
+log:
+  level: info
+
+# OPTIONAL:
+# If you are 100% sure your account is in EU, keep this collector line.
+# Otherwise, remove it (recommended initially) and let NR auto-route.
+#
+# collector: https://infra-api.eu.newrelic.com
+

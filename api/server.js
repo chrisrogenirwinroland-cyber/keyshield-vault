@@ -23,6 +23,11 @@ app.options(/.*/, cors(corsOptions));
 
 app.use(express.json());
 
+// ✅ Root route so "curl http://localhost:3000" returns 200
+app.get("/", (req, res) => {
+  res.status(200).send("Keyshield API OK");
+});
+
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -34,6 +39,8 @@ app.get("/health", (req, res) => {
 app.use("/auth", authRoutes);
 app.use("/admin", adminRoutes);
 app.use("/client", clientRoutes);
+
+// metricsRoutes should expose /metrics (and maybe /metrics.json etc)
 app.use("/", metricsRoutes);
 
 const PORT = process.env.PORT || 3000;

@@ -1,0 +1,42 @@
+groups:
+  - name: keyshield-basic-alerts
+    rules:
+      - alert: KeyshieldTestAlert
+        expr: vector(1)
+        for: 0m
+        labels:
+          severity: info
+          team: keyshield
+        annotations:
+          summary: "Test alert from Keyshield monitoring"
+          description: "If you received this email, Prometheus -> Alertmanager -> SMTP is working."
+
+      - alert: PrometheusTargetDown
+        expr: up == 0
+        for: 10s
+        labels:
+          severity: critical
+          team: keyshield
+        annotations:
+          summary: "Target down: {{ $labels.job }} ({{ $labels.instance }})"
+          description: "Prometheus cannot scrape {{ $labels.job }} at {{ $labels.instance }} for 2+ minutes."
+
+      - alert: HostHighCPU
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 5m
+        labels:
+          severity: warning
+          team: keyshield
+        annotations:
+          summary: "High CPU on {{ $labels.instance }}"
+          description: "CPU usage > 85% for 5+ minutes."
+
+      - alert: HostLowDiskSpace
+        expr: (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) * 100 < 10
+        for: 10m
+        labels:
+          severity: critical
+          team: keyshield
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}"
+          description: "Free disk < 10% for 10+ minutes."

@@ -1,23 +1,32 @@
+﻿name: keyshield-vault
+
 services:
   api:
-    build: ./api
+    build:
+      context: ./api
+      dockerfile: Dockerfile
     container_name: keyshield-api
+    restart: unless-stopped
+    environment:
+      JWT_SECRET: dev-secret-change-me
+      # Ensure the app writes DB files into persistent volume (adjust if your app uses a different path)
+      DATA_DIR: /app/data
     ports:
       - "3000:3000"
-    environment:
-      - JWT_SECRET=dev-secret-change-me
     volumes:
       - api_data:/app/data
-    restart: unless-stopped
 
   frontend:
-    build: ./frontend/app
+    build:
+      context: ./frontend/app
+      dockerfile: Dockerfile
     container_name: keyshield-frontend
-    ports:
-      - "4200:80"
+    restart: unless-stopped
     depends_on:
       - api
-    restart: unless-stopped
+    ports:
+      - "4200:80"
 
 volumes:
   api_data:
+    name: keyshield-vault_api_data

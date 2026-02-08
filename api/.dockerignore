@@ -1,0 +1,14 @@
+﻿node_modules
+npm-debug.log
+yarn.lock
+pnpm-lock.yaml
+.DS_Store
+.git
+.gitignore
+Dockerfile*
+dist
+build
+coverage
+.env
+node_modules/
+api/node_modules/

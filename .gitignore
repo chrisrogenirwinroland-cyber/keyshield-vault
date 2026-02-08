@@ -2,3 +2,26 @@
 # Local runtime DB
 api/data.db
 
+# Secrets / env
+.env
+.env.*
+monitoring/alertmanager/.env
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+.env
+.env.*
+monitoring/alertmanager/.env
+monitoring/alertmanager/alertmanager.yml
+node_modules/
+api/node_modules/
