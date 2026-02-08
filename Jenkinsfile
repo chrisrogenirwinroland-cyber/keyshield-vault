@@ -1,22 +1,4 @@
 // Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, Docker, Email alerts)
-//
-// Repo layout:
-//  - api/package.json, api/package-lock.json, api/Dockerfile
-//  - frontend/app/package.json, frontend/app/package-lock.json, frontend/app/Dockerfile
-//  - docker-compose.yml at repo root
-//
-// Jenkins requirements:
-//  - SonarQube Scanner tool in Jenkins: "SonarQubeScanner"
-//  - SonarCloud server in Jenkins: "SonarCloud"
-//  - Credentials:
-//      * sonar-token (Secret text)         -> SonarCloud token
-//      * dockerhub-creds (Username/Pass)   -> DockerHub
-//      * nvd-api-key (Secret text)         -> NVD API key for Dependency-Check
-//  - Email Extension Plugin configured (SMTP)
-//
-// IMPORTANT: Trivy must be on Jenkins service PATH.
-// If "trivy not recognized", restart Jenkins service OR add to Jenkins global env PATH:
-//   C:\ProgramData\chocolatey\bin
 
 pipeline {
   agent any
@@ -429,7 +411,7 @@ pipeline {
           if (($totalHigh + $totalCritical) -eq 0) {
             $resultLine = "OK: No HIGH/CRITICAL vulnerabilities or misconfigurations detected (Trivy)."
           } else {
-            $resultLine = "WARN: HIGH/CRITICAL findings detected. Review Trivy attachments."
+            $resultLine = "WARN: HIGH/CRITICAL findings detected. Review Trivy reports."
           }
 
           $summary = @"
@@ -673,99 +655,105 @@ Grafana:    $env:GRAFANA_URL
         }
       }
     }
-  } // نهاية stages
-post {
-  always {
-    bat """
-      echo ===== POST: DOCKER PS =====
-      docker ps
 
-      echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
-      docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
-    """
-    archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
-  }
+  } // end stages
 
-  success {
-    script {
-      // ---- Safe read (no "file not found" break) ----
-      def readSafe = { p, fb -> fileExists(p) ? readFile(p) : fb }
+  // ===== Pipeline-level post (EMAIL formatting fixed; removed "Attachments included" text section) =====
+  post {
 
-      // ---- Clip long text blocks to keep email readable ----
-      def clip = { s, n ->
-        def x = (s ?: '')
-        (x.length() > n) ? (x.substring(0, n) + "\n...[clipped]...") : x
-      }
+    always {
+      bat """
+        echo ===== POST: DOCKER PS =====
+        docker ps
 
-      // ---- Fix ï»¿ (BOM) + remove ANSI escape color codes ([33m etc) ----
-      def deBom = { s ->
-        (s ?: '')
-          .replace('\uFEFF', '') // real BOM char
-          .replace('ï»¿', '')     // BOM rendered as mojibake
-      }
+        echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
+        docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
+      """
+      archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
+    }
 
-      def stripAnsi = { s ->
-        def x = (s ?: '')
-        x = x.replaceAll(/\u001B\[[0-9;?]*[ -\/]*[@-~]/, '') // CSI
-        x = x.replaceAll(/\u009B[0-9;?]*[ -\/]*[@-~]/, '')   // single-byte CSI (rare)
-        return x
-      }
+    success {
+      script {
+        // ---------- Safe file read ----------
+        def readSafe = { p, fb -> fileExists(p) ? readFile(p) : fb }
 
-      def clean = { s -> stripAnsi(deBom(s)) }
+        // ---------- Clip long outputs ----------
+        def clip = { s, n ->
+          def x = (s ?: '')
+          (x.length() > n) ? (x.substring(0, n) + "\n...[clipped]...") : x
+        }
 
-      // ---- HTML escape (after cleaning) ----
-      def esc = { s ->
-        (s ?: '')
-          .replace("&", "&amp;")
-          .replace("<", "&lt;")
-          .replace(">", "&gt;")
-      }
+        // ---------- Remove BOM + ANSI (fix ï»¿ and [33m codes) ----------
+        def deBom = { s ->
+          (s ?: '')
+            .replace('\uFEFF', '')
+            .replace('ï»¿', '')
+        }
 
-      // ---- Load report snippets (cleaned) ----
-      def buildSum    = clean(readSafe('reports/build-summary.txt', 'No build-summary.txt generated.'))
-      def vulnSummary = clean(readSafe('reports/vuln-summary.txt',  'No vuln-summary.txt generated.'))
-      def smoke       = clean(readSafe('reports/smoke-test.txt',    'No smoke-test.txt generated.'))
-      def monitorVal  = clean(readSafe('reports/alerts-validation.txt', 'No alerts-validation.txt generated.'))
+        def stripAnsi = { s ->
+          def x = (s ?: '')
+          x = x.replaceAll(/\u001B\[[0-9;?]*[ -\/]*[@-~]/, '')
+          x = x.replaceAll(/\u009B[0-9;?]*[ -\/]*[@-~]/, '')
+          return x
+        }
 
-      def eslintApi   = clean(readSafe('reports/eslint/eslint-api.txt', 'No ESLint API output (lint script missing or produced no file).'))
-      def eslintFe    = clean(readSafe('reports/eslint/eslint-fe.txt',  'No ESLint Frontend output (lint script missing or produced no file).'))
-      def prettier    = clean(readSafe('reports/prettier/prettier-check.txt', 'No Prettier output.'))
+        def clean = { s -> stripAnsi(deBom(s)) }
 
-      def dcNote      = clean(readSafe('reports/dependency-check/dependency-check-note.txt',
-                                       'No dependency-check-note.txt (see reports/dependency-check/).'))
+        // ---------- HTML escape ----------
+        def esc = { s ->
+          (s ?: '')
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        }
 
-      // ---- Attachments STILL sent (only removed the "Attachments included" TEXT section from email body) ----
-      def attachments = [
-        'reports/build-summary.txt',
-        'reports/vuln-summary.txt',
-        'reports/trivy-fs.txt',
-        'reports/trivy-fs.json',
-        'reports/trivy-api-image.json',
-        'reports/trivy-fe-image.json',
-        'reports/smoke-test.txt',
-        'reports/alerts-validation.txt',
-        'reports/monitoring-note.txt',
-        'reports/monitoring-ps.txt',
-        'reports/eslint/**',
-        'reports/prettier/**',
-        'reports/dependency-check/**'
-      ].join(',')
+        // ---------- Load report snippets ----------
+        def buildSum    = clean(readSafe('reports/build-summary.txt', 'Build summary not generated.'))
+        def vulnSummary = clean(readSafe('reports/vuln-summary.txt',  'Vulnerability summary not generated.'))
+        def smoke       = clean(readSafe('reports/smoke-test.txt',    'Smoke test report not generated.'))
+        def monitorVal  = clean(readSafe('reports/alerts-validation.txt', 'Alerts validation report not generated.'))
 
-      emailext(
-        to: "${ALERT_TO}",
-        subject: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.GIT_SHA})",
-        mimeType: 'text/html; charset=UTF-8',
-        attachmentsPattern: attachments,
-        body: """
+        def eslintApi   = clean(readSafe('reports/eslint/eslint-api.txt', 'ESLint (API) output not generated.'))
+        def eslintFe    = clean(readSafe('reports/eslint/eslint-fe.txt',  'ESLint (Frontend) output not generated.'))
+        def prettier    = clean(readSafe('reports/prettier/prettier-check.txt', 'Prettier output not generated.'))
+
+        def dcNote      = clean(readSafe('reports/dependency-check/dependency-check-note.txt',
+                                         'Dependency-Check note not generated.'))
+
+        // Keep attachments enabled (only removed the "attachments included" TEXT section from email body)
+        def attachments = [
+          'reports/build-summary.txt',
+          'reports/vuln-summary.txt',
+          'reports/trivy-fs.txt',
+          'reports/trivy-fs.json',
+          'reports/trivy-api-image.json',
+          'reports/trivy-fe-image.json',
+          'reports/smoke-test.txt',
+          'reports/alerts-validation.txt',
+          'reports/monitoring-note.txt',
+          'reports/monitoring-ps.txt',
+          'reports/eslint/**',
+          'reports/prettier/**',
+          'reports/dependency-check/**'
+        ].join(',')
+
+        emailext(
+          to: "${ALERT_TO}",
+          subject: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.GIT_SHA})",
+          mimeType: 'text/html; charset=UTF-8',
+          attachmentsPattern: attachments,
+          body: """
 <!doctype html>
 <html>
 <head><meta charset="UTF-8"></head>
 <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222; line-height:1.35;">
 
-  <h2 style="margin:0 0 10px 0;">
-    CI/CD Pipeline Result:
-    <span style="color:#1a7f37; font-weight:700;">SUCCESS</span>
-  </h2>
+  <div style="margin-bottom:10px;">
+    <h2 style="margin:0 0 8px 0;">
+      CI/CD Pipeline Result:
+      <span style="color:#1a7f37; font-weight:700;">SUCCESS</span>
+    </h2>
+  </div>
 
   <table cellpadding="8" cellspacing="0" style="border-collapse:collapse; border:1px solid #ddd; width:100%; max-width:820px;">
     <tr><td style="border:1px solid #ddd; width:140px;"><b>Job</b></td><td style="border:1px solid #ddd;">${env.JOB_NAME}</td></tr>
@@ -815,18 +803,18 @@ post {
 </body>
 </html>
 """
-      )
+        )
+      }
     }
-  }
 
-  failure {
-    emailext(
-      to: "${ALERT_TO}",
-      subject: "FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.GIT_SHA})",
-      mimeType: 'text/html; charset=UTF-8',
-      attachmentsPattern: 'reports/**',
-      attachLog: true,
-      body: """
+    failure {
+      emailext(
+        to: "${ALERT_TO}",
+        subject: "FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.GIT_SHA})",
+        mimeType: 'text/html; charset=UTF-8',
+        attachmentsPattern: 'reports/**',
+        attachLog: true,
+        body: """
 <!doctype html>
 <html>
 <head><meta charset="UTF-8"></head>
@@ -841,7 +829,7 @@ post {
     <b>Commit:</b> ${env.GIT_SHA}<br/>
     <b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a>
   </p>
-  <p style="margin:0 0 10px 0;">Console log attached. Reports (if generated) are archived in Jenkins.</p>
+  <p style="margin:0 0 10px 0;">Console log attached. Any generated reports are archived in Jenkins artifacts.</p>
   <p style="color:#666; margin-top:16px;">
     Regards,<br/>
     Jenkins CI/CD Pipeline<br/>
@@ -850,6 +838,9 @@ post {
 </body>
 </html>
 """
-    )
-  }
-}
+      )
+    }
+
+  } // end post
+
+} // end pipeline
