@@ -1,15 +1,14 @@
-// Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, ESLint+Prettier, Trivy, OWASP Dependency-Check, Gitleaks, Docker, Monitoring, Professional Email)
+// Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, Docker, Email alerts)
+// Added:
+//   - Code Quality: ESLint + Prettier (non-blocking reports)
+//   - Security: OWASP Dependency-Check (SCA) + Gitleaks (secrets scan) (non-blocking reports)
 //
-// NOTE: This is your WORKING pipeline + ADDED:
-//   Code Quality: ESLint + Prettier (non-empty reports, does not change your creds/keys)
-//   Security: OWASP Dependency-Check + Gitleaks (secret scanning) (reports even when 0 findings)
-//
-// Repo layout (your confirmed structure):
+// Repo layout:
 //  - api/package.json, api/package-lock.json, api/Dockerfile
 //  - frontend/app/package.json, frontend/app/package-lock.json, frontend/app/Dockerfile
 //  - docker-compose.yml at repo root
 //
-// Jenkins requirements (already in your setup):
+// Jenkins requirements:
 //  - SonarQube Scanner tool configured in Jenkins as: "SonarQubeScanner"
 //  - SonarCloud server configured in Jenkins as: "SonarCloud"
 //  - Credentials:
@@ -70,6 +69,7 @@ pipeline {
       steps {
         checkout scm
         bat """
+          @echo off
           echo ===== GIT TRACEABILITY =====
           git --version
           git rev-parse --short HEAD
@@ -77,10 +77,9 @@ pipeline {
           git status
         """
         script {
-          env.GIT_SHA = powershell(
-            script: '(git rev-parse --short HEAD).Trim()',
-            returnStdout: true
-          ).trim()
+          // More reliable on Windows Jenkins than powershell() in some setups:
+          def raw = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short HEAD').trim()
+          env.GIT_SHA = raw?.tokenize()?.last()
           if (!env.GIT_SHA) { env.GIT_SHA = "manual" }
           echo "Resolved GIT_SHA = ${env.GIT_SHA}"
         }
@@ -90,6 +89,7 @@ pipeline {
     stage('Preflight (Toolchain Verification)') {
       steps {
         bat """
+          @echo off
           echo ===== TOOL VERSIONS =====
           where node
           node -v
@@ -102,12 +102,12 @@ pipeline {
           echo ===== TRIVY =====
           where trivy
           trivy --version
-        """
-        bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
-        bat """
+
+          echo ===== SETUP REPORT DIR =====
           if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
           echo Preflight complete > "%REPORT_DIR%\\preflight.txt"
         """
+        bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
       }
     }
 
@@ -115,6 +115,7 @@ pipeline {
       steps {
         dir('api') {
           bat """
+            @echo off
             echo ===== API INSTALL =====
             npm ci
 
@@ -135,6 +136,7 @@ pipeline {
       steps {
         dir('frontend/app') {
           bat """
+            @echo off
             echo ===== FE INSTALL =====
             npm ci
 
@@ -151,37 +153,63 @@ pipeline {
       }
     }
 
-    // =========================================================
-    // ADDED: Code Quality - ESLint + Prettier (fast, clear)
-    // Notes:
-    //  - Works even if scripts don't exist; falls back to npx commands.
-    //  - Generates reports even if 0 issues.
-    // =========================================================
+    // ----------------------------
+    // CODE QUALITY (ADDED)
+    // ----------------------------
+
     stage('Code Quality - ESLint (API + Frontend)') {
       steps {
         bat """
+          @echo off
+          setlocal enabledelayedexpansion
           echo ===== ESLINT CODE QUALITY =====
-          if not exist "%REPORT_DIR%\\eslint" mkdir "%REPORT_DIR%\\eslint"
+
+          if not exist "%WORKSPACE%\\%REPORT_DIR%\\eslint" mkdir "%WORKSPACE%\\%REPORT_DIR%\\eslint"
+
+          set OUT_API=%WORKSPACE%\\%REPORT_DIR%\\eslint\\eslint-api.txt
+          set TMP_API=%WORKSPACE%\\%REPORT_DIR%\\eslint\\eslint-api.%BUILD_NUMBER%.tmp
+          set OUT_FE=%WORKSPACE%\\%REPORT_DIR%\\eslint\\eslint-fe.txt
+          set TMP_FE=%WORKSPACE%\\%REPORT_DIR%\\eslint\\eslint-fe.%BUILD_NUMBER%.tmp
 
           echo -- API ESLint
-          cd api
+          pushd api
           if exist package.json (
-            npm run lint --silent > "..\\%REPORT_DIR%\\eslint\\eslint-api.txt" 2>&1 || echo ESLint API issues detected (see report) >> "..\\%REPORT_DIR%\\eslint\\eslint-api.txt"
+            call npm run lint --silent > "!TMP_API!" 2>&1
+            set RC=!ERRORLEVEL!
+            if not "!RC!"=="0" (
+              echo.>> "!TMP_API!"
+              echo ESLint API issues detected (non-blocking). See output above.>> "!TMP_API!"
+            ) else (
+              echo.>> "!TMP_API!"
+              echo ESLint API: no issues detected.>> "!TMP_API!"
+            )
           ) else (
-            echo api/package.json not found > "..\\%REPORT_DIR%\\eslint\\eslint-api.txt"
+            echo api/package.json not found> "!TMP_API!"
           )
-          cd ..
+          popd
 
           echo -- Frontend ESLint
-          cd frontend\\app
+          pushd frontend\\app
           if exist package.json (
-            npm run lint --silent > "..\\..\\%REPORT_DIR%\\eslint\\eslint-fe.txt" 2>&1 || echo ESLint FE issues detected (see report) >> "..\\..\\%REPORT_DIR%\\eslint\\eslint-fe.txt"
+            call npm run lint --silent > "!TMP_FE!" 2>&1
+            set RC=!ERRORLEVEL!
+            if not "!RC!"=="0" (
+              echo.>> "!TMP_FE!"
+              echo ESLint Frontend issues detected (non-blocking). See output above.>> "!TMP_FE!"
+            ) else (
+              echo.>> "!TMP_FE!"
+              echo ESLint Frontend: no issues detected.>> "!TMP_FE!"
+            )
           ) else (
-            echo frontend/app/package.json not found > "..\\..\\%REPORT_DIR%\\eslint\\eslint-fe.txt"
+            echo frontend/app/package.json not found> "!TMP_FE!"
           )
-          cd ..\\..
+          popd
+
+          copy /y "!TMP_API!" "!OUT_API!" >nul 2>&1
+          copy /y "!TMP_FE!"  "!OUT_FE!"  >nul 2>&1
 
           echo ===== ESLINT COMPLETE =====
+          exit /b 0
         """
       }
       post {
@@ -194,16 +222,30 @@ pipeline {
     stage('Code Quality - Prettier (Format Check)') {
       steps {
         bat """
+          @echo off
+          setlocal enabledelayedexpansion
           echo ===== PRETTIER FORMAT CHECK =====
-          if not exist "%REPORT_DIR%\\prettier" mkdir "%REPORT_DIR%\\prettier"
 
-          echo -- Prettier check (repo)
-          rem Uses npx so it runs even if prettier is devDependency; if not installed, it will still attempt.
-          npx --yes prettier -c . > "%REPORT_DIR%\\prettier\\prettier-check.txt" 2>&1 || (
-            echo Prettier found formatting differences or is not configured. See report. >> "%REPORT_DIR%\\prettier\\prettier-check.txt"
+          if not exist "%WORKSPACE%\\%REPORT_DIR%\\prettier" mkdir "%WORKSPACE%\\%REPORT_DIR%\\prettier"
+
+          set OUT=%WORKSPACE%\\%REPORT_DIR%\\prettier\\prettier-check.txt
+          set TMP=%WORKSPACE%\\%REPORT_DIR%\\prettier\\prettier-check.%BUILD_NUMBER%.tmp
+
+          rem Uses npx so it runs even if prettier is devDependency; if not installed it will attempt download.
+          npx --yes prettier -c . > "!TMP!" 2>&1
+          set RC=!ERRORLEVEL!
+
+          if not "!RC!"=="0" (
+            echo.>> "!TMP!"
+            echo Prettier found formatting differences OR Prettier is not configured. (non-blocking)>> "!TMP!"
+          ) else (
+            echo.>> "!TMP!"
+            echo Prettier: formatting OK.>> "!TMP!"
           )
 
-          echo ===== PRETTIER CHECK COMPLETE =====
+          copy /y "!TMP!" "!OUT!" >nul 2>&1
+          echo ===== PRETTIER COMPLETE =====
+          exit /b 0
         """
       }
       post {
@@ -213,10 +255,15 @@ pipeline {
       }
     }
 
+    // ----------------------------
+    // BUILD (artefact) + SONAR
+    // ----------------------------
+
     stage('Build - Frontend (Angular)') {
       steps {
         dir('frontend/app') {
           bat """
+            @echo off
             echo ===== FE BUILD =====
             npm run build
           """
@@ -236,6 +283,7 @@ pipeline {
           withSonarQubeEnv("${SONAR_SERVER_NAME}") {
             withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
               bat """
+                @echo off
                 echo ===== SONARCLOUD SCAN (MONOREPO) =====
                 echo ProjectKey: %SONAR_PROJECT_KEY%
                 echo Org: %SONAR_ORG%
@@ -256,9 +304,14 @@ pipeline {
       }
     }
 
+    // ----------------------------
+    // SECURITY (Trivy + Dependency-Check + Gitleaks)
+    // ----------------------------
+
     stage('Security - Trivy FS Scan (vuln+misconfig)') {
       steps {
         bat """
+          @echo off
           echo ===== TRIVY FILESYSTEM SCAN =====
           if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
 
@@ -278,6 +331,7 @@ pipeline {
     stage('Build Docker Images') {
       steps {
         bat """
+          @echo off
           echo ===== DOCKER BUILD =====
           set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
           set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
@@ -297,6 +351,7 @@ pipeline {
     stage('Security - Trivy Image Scan (TAR input, Windows-safe)') {
       steps {
         bat """
+          @echo off
           echo ===== TRIVY IMAGE SCAN (TAR) =====
           if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
 
@@ -319,54 +374,74 @@ pipeline {
       }
     }
 
-    // =========================================================
-    // ADDED: OWASP Dependency-Check (SCA) - Docker-based (easy)
-    // Produces reports even if 0 findings.
-    // =========================================================
     stage('Security - OWASP Dependency-Check (SCA)') {
       steps {
         bat """
-          echo ===== OWASP DEPENDENCY-CHECK =====
-          if not exist "%REPORT_DIR%\\depcheck" mkdir "%REPORT_DIR%\\depcheck"
+          @echo off
+          setlocal
+          echo ===== OWASP DEPENDENCY-CHECK (SCA) =====
 
+          if not exist "%WORKSPACE%\\%REPORT_DIR%\\dependency-check" mkdir "%WORKSPACE%\\%REPORT_DIR%\\dependency-check"
+
+          rem Fast scan: lockfiles + package.json only (avoids node_modules crawl)
+          rem Runs via Docker so you do NOT need local install.
           docker run --rm ^
-            -v "%CD%:/src" ^
-            -v "%CD%\\%REPORT_DIR%\\depcheck:/report" ^
+            -v "%WORKSPACE%:/src" ^
+            -w /src ^
             owasp/dependency-check:latest ^
-            --scan /src ^
-            --format "ALL" ^
-            --out /report ^
-            --project "%APP_NAME%-%GIT_SHA%"
+            --project "%APP_NAME%" ^
+            --scan /src/api/package-lock.json ^
+            --scan /src/api/package.json ^
+            --scan /src/frontend/app/package-lock.json ^
+            --scan /src/frontend/app/package.json ^
+            --format "HTML,JSON" ^
+            --out /src/%REPORT_DIR%/dependency-check ^
+            --failOnCVSS 11
 
-          echo ===== DEPENDENCY-CHECK COMPLETE =====
+          set DC_RC=%ERRORLEVEL%
+          if not "%DC_RC%"=="0" (
+            echo Dependency-Check completed with non-zero exit code (%DC_RC%). Reports generated where possible.> "%WORKSPACE%\\%REPORT_DIR%\\dependency-check\\dependency-check-note.txt"
+          ) else (
+            echo Dependency-Check completed successfully.> "%WORKSPACE%\\%REPORT_DIR%\\dependency-check\\dependency-check-note.txt"
+          )
+
+          exit /b 0
         """
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/depcheck/**'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/dependency-check/**'
         }
       }
     }
 
-    // =========================================================
-    // ADDED: Gitleaks (Secrets scanning) - Docker-based (easy)
-    // Non-blocking by default; still generates report for email.
-    // =========================================================
     stage('Security - Secrets Scan (Gitleaks)') {
       steps {
         bat """
-          echo ===== GITLEAKS SECRET SCAN =====
-          if not exist "%REPORT_DIR%\\gitleaks" mkdir "%REPORT_DIR%\\gitleaks"
+          @echo off
+          setlocal
+          echo ===== GITLEAKS SECRETS SCAN =====
 
+          if not exist "%WORKSPACE%\\%REPORT_DIR%\\gitleaks" mkdir "%WORKSPACE%\\%REPORT_DIR%\\gitleaks"
+
+          rem Run via Docker image (no local install required)
           docker run --rm ^
-            -v "%CD%:/repo" ^
-            zricethezav/gitleaks:latest ^
-            detect --source="/repo" ^
-            --report-format "json" ^
-            --report-path "/repo/%REPORT_DIR%/gitleaks/gitleaks-report.json" ^
-            --redact || exit /b 0
+            -v "%WORKSPACE%:/src" ^
+            gitleaks/gitleaks:latest ^
+            detect --source=/src --report-format json --report-path /src/%REPORT_DIR%/gitleaks/gitleaks-report.json --redact
 
-          echo ===== GITLEAKS COMPLETE (non-blocking) =====
+          set GL_RC=%ERRORLEVEL%
+
+          rem If report was not created (some versions do not create empty file), force an empty JSON array
+          if not exist "%WORKSPACE%\\%REPORT_DIR%\\gitleaks\\gitleaks-report.json" echo []> "%WORKSPACE%\\%REPORT_DIR%\\gitleaks\\gitleaks-report.json"
+
+          if not "%GL_RC%"=="0" (
+            echo Potential secrets detected OR scan returned non-zero exit (%GL_RC%). Review gitleaks-report.json.> "%WORKSPACE%\\%REPORT_DIR%\\gitleaks\\gitleaks-note.txt"
+          ) else (
+            echo No secrets detected by Gitleaks.> "%WORKSPACE%\\%REPORT_DIR%\\gitleaks\\gitleaks-note.txt"
+          )
+
+          exit /b 0
         """
       }
       post {
@@ -379,13 +454,12 @@ pipeline {
     stage('Security - Vulnerability Summary (includes 0 findings)') {
       steps {
         powershell '''
-          Write-Host "===== VULNERABILITY SUMMARY ====="
+          Write-Host "===== SECURITY SUMMARY (TRIVY + DEP-CHECK + GITLEAKS) ====="
           if (-not (Test-Path $env:REPORT_DIR)) { New-Item -ItemType Directory -Force $env:REPORT_DIR | Out-Null }
 
           function Count-Trivy($path) {
             $out = [ordered]@{ VulnHigh=0; VulnCritical=0; MisHigh=0; MisCritical=0 }
             if (-not (Test-Path $path -PathType Leaf)) { return $out }
-
             try { $json = Get-Content $path -Raw | ConvertFrom-Json } catch { return $out }
             if ($null -eq $json.Results) { return $out }
 
@@ -406,56 +480,83 @@ pipeline {
             return $out
           }
 
-          function Text-IfMissing($path, $text) {
-            if (-not (Test-Path $path -PathType Leaf)) {
-              $text | Set-Content -Path $path -Encoding UTF8
-            }
+          # Trivy
+          $fs  = Count-Trivy (Join-Path $env:REPORT_DIR "trivy-fs.json")
+          $api = Count-Trivy (Join-Path $env:REPORT_DIR "trivy-api-image.json")
+          $fe  = Count-Trivy (Join-Path $env:REPORT_DIR "trivy-fe-image.json")
+          $trivyHigh     = $fs.VulnHigh + $api.VulnHigh + $fe.VulnHigh + $fs.MisHigh
+          $trivyCritical = $fs.VulnCritical + $api.VulnCritical + $fe.VulnCritical + $fs.MisCritical
+
+          $trivyLine = if (($trivyHigh + $trivyCritical) -eq 0) {
+            "✅ No HIGH/CRITICAL vulnerabilities or misconfigurations were detected (Trivy)."
+          } else {
+            "⚠️ HIGH/CRITICAL findings detected (Trivy). Review attachments."
           }
 
-          $fsPath  = Join-Path $env:REPORT_DIR "trivy-fs.json"
-          $apiPath = Join-Path $env:REPORT_DIR "trivy-api-image.json"
-          $fePath  = Join-Path $env:REPORT_DIR "trivy-fe-image.json"
-          Text-IfMissing $fsPath  '{"Results":[]}'
-          Text-IfMissing $apiPath '{"Results":[]}'
-          Text-IfMissing $fePath  '{"Results":[]}'
-
-          $fs  = Count-Trivy $fsPath
-          $api = Count-Trivy $apiPath
-          $fe  = Count-Trivy $fePath
-
-          $totalHigh     = $fs.VulnHigh + $api.VulnHigh + $fe.VulnHigh + $fs.MisHigh
-          $totalCritical = $fs.VulnCritical + $api.VulnCritical + $fe.VulnCritical + $fs.MisCritical
-
-          $resultLine = ""
-          if (($totalHigh + $totalCritical) -eq 0) {
-            $resultLine = "✅ No HIGH/CRITICAL vulnerabilities or misconfigurations were detected (Trivy)."
+          # Dependency-Check (best-effort parse)
+          $dcPath = Join-Path $env:REPORT_DIR "dependency-check\\dependency-check-report.json"
+          $dcCount = 0
+          $dcHigh = 0
+          $dcCritical = 0
+          if (Test-Path $dcPath -PathType Leaf) {
+            try {
+              $dc = Get-Content $dcPath -Raw | ConvertFrom-Json
+              if ($dc.dependencies) {
+                foreach ($d in $dc.dependencies) {
+                  if ($d.vulnerabilities) {
+                    foreach ($v in $d.vulnerabilities) {
+                      $dcCount++
+                      $sev = ($v.severity | ForEach-Object { "$_".ToUpperInvariant() })
+                      if ($sev -eq "HIGH") { $dcHigh++ }
+                      if ($sev -eq "CRITICAL") { $dcCritical++ }
+                    }
+                  }
+                }
+              }
+            } catch {}
+          }
+          $dcLine = if ($dcCount -eq 0) {
+            "✅ No vulnerabilities detected (OWASP Dependency-Check) OR report not present."
           } else {
-            $resultLine = "⚠️ HIGH/CRITICAL findings detected. Review Trivy attachments for details."
+            "⚠️ Dependency-Check detected vulnerabilities: Total=$dcCount (HIGH=$dcHigh, CRITICAL=$dcCritical)."
+          }
+
+          # Gitleaks (count findings)
+          $glPath = Join-Path $env:REPORT_DIR "gitleaks\\gitleaks-report.json"
+          $glCount = 0
+          if (Test-Path $glPath -PathType Leaf) {
+            try {
+              $gl = Get-Content $glPath -Raw | ConvertFrom-Json
+              if ($gl) { $glCount = @($gl).Count } else { $glCount = 0 }
+            } catch { $glCount = 0 }
+          }
+          $glLine = if ($glCount -eq 0) {
+            "✅ No secrets detected (Gitleaks)."
+          } else {
+            "⚠️ Potential secrets detected (Gitleaks): Findings=$glCount. Review gitleaks-report.json."
           }
 
           $summary = @"
-Trivy Security Summary (HIGH/CRITICAL)
+Security Summary (HIGH/CRITICAL focus)
 =====================================
 Job:    $env:JOB_NAME
 Build:  #$env:BUILD_NUMBER
 Commit: $env:GIT_SHA
 
-Filesystem Scan:
-  Vulnerabilities  HIGH=$($fs.VulnHigh)  CRITICAL=$($fs.VulnCritical)
-  Misconfig        HIGH=$($fs.MisHigh)   CRITICAL=$($fs.MisCritical)
+Trivy (FS + Images):
+  HIGH=$trivyHigh
+  CRITICAL=$trivyCritical
+  Result: $trivyLine
 
-API Image Scan:
-  Vulnerabilities  HIGH=$($api.VulnHigh) CRITICAL=$($api.VulnCritical)
+OWASP Dependency-Check (SCA):
+  Total Vulns=$dcCount
+  HIGH=$dcHigh
+  CRITICAL=$dcCritical
+  Result: $dcLine
 
-Frontend Image Scan:
-  Vulnerabilities  HIGH=$($fe.VulnHigh)  CRITICAL=$($fe.VulnCritical)
-
-Totals:
-  HIGH=$totalHigh
-  CRITICAL=$totalCritical
-
-Result:
-  $resultLine
+Gitleaks (Secrets):
+  Findings=$glCount
+  Result: $glLine
 "@
 
           $outPath = Join-Path $env:REPORT_DIR "vuln-summary.txt"
@@ -470,10 +571,15 @@ Result:
       }
     }
 
+    // ----------------------------
+    // PUSH, DEPLOY, RELEASE, MONITORING (unchanged)
+    // ----------------------------
+
     stage('Push Images (Docker Hub)') {
       steps {
         withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS_ID}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
           bat """
+            @echo off
             echo ===== DOCKER LOGIN =====
             echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
 
@@ -494,11 +600,13 @@ Result:
     stage('Deploy - Docker Compose (Staging)') {
       steps {
         bat '''
+          @echo off
           echo ===== CLEAN OLD CONTAINERS =====
           docker rm -f keyshield-api 2>NUL || echo "No old keyshield-api to remove"
           docker rm -f keyshield-frontend 2>NUL || echo "No old keyshield-frontend to remove"
         '''
         bat """
+          @echo off
           echo ===== DEPLOY STAGING =====
           docker compose -f docker-compose.yml down
           docker compose -f docker-compose.yml up -d --build
@@ -508,6 +616,7 @@ Result:
       }
     }
 
+    // ✅ Groovy-safe PowerShell (triple single quotes)
     stage('Release - Smoke / Health Validation') {
       steps {
         powershell '''
@@ -517,6 +626,7 @@ Result:
           $feCode = "N/A"
           $apiCode = "N/A"
 
+          # Frontend
           try {
             $r1 = Invoke-WebRequest $env:FE_URL -UseBasicParsing -TimeoutSec 20
             $feCode = $r1.StatusCode
@@ -526,6 +636,7 @@ Result:
             throw
           }
 
+          # API - prefer /health but fallback to root
           try {
             $healthUrl = "$env:API_URL/health"
             $r2 = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 20
@@ -569,6 +680,7 @@ API HTTP: $apiCode
             exit 0
           }
 
+          # Bind-mount fix: alertmanager.yml must be a FILE
           $amPath = Join-Path (Get-Location) "monitoring\\alertmanager\\alertmanager.yml"
 
           if (Test-Path $amPath -PathType Container) {
@@ -684,6 +796,7 @@ Grafana:    $env:GRAFANA_URL
   post {
     always {
       bat """
+        @echo off
         echo ===== POST: DOCKER PS =====
         docker ps
 
@@ -699,10 +812,6 @@ Grafana:    $env:GRAFANA_URL
         def smoke      = fileExists('reports/smoke-test.txt') ? readFile('reports/smoke-test.txt') : 'No smoke-test.txt generated.'
         def monitorVal = fileExists('reports/alerts-validation.txt') ? readFile('reports/alerts-validation.txt') : 'No alerts-validation.txt generated.'
 
-        def eslintApi  = fileExists('reports/eslint/eslint-api.txt') ? readFile('reports/eslint/eslint-api.txt') : 'No eslint-api.txt generated.'
-        def eslintFe   = fileExists('reports/eslint/eslint-fe.txt')  ? readFile('reports/eslint/eslint-fe.txt')  : 'No eslint-fe.txt generated.'
-        def prettier   = fileExists('reports/prettier/prettier-check.txt') ? readFile('reports/prettier/prettier-check.txt') : 'No prettier-check.txt generated.'
-
         def esc = { s ->
           (s ?: '')
             .replace("&", "&amp;")
@@ -714,7 +823,10 @@ Grafana:    $env:GRAFANA_URL
           to: "${ALERT_TO}",
           subject: "✅ SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
           mimeType: 'text/html',
-          attachmentsPattern: 'reports/**',
+          attachmentsPattern: 'reports/build-summary.txt,reports/vuln-summary.txt,' +
+                              'reports/trivy-fs.txt,reports/trivy-fs.json,reports/trivy-api-image.json,reports/trivy-fe-image.json,' +
+                              'reports/smoke-test.txt,reports/alerts-validation.txt,reports/monitoring-note.txt,reports/monitoring-ps.txt,' +
+                              'reports/eslint/**,reports/prettier/**,reports/dependency-check/**,reports/gitleaks/**',
           body: """
           <html>
             <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
@@ -737,24 +849,16 @@ Grafana:    $env:GRAFANA_URL
               <h3 style="margin:14px 0 8px 0;">Release Smoke Test</h3>
               <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(smoke)}</pre>
 
-              <h3 style="margin:14px 0 8px 0;">Code Quality (ESLint)</h3>
-              <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">API:
-${esc(eslintApi)}
-
-Frontend:
-${esc(eslintFe)}</pre>
-
-              <h3 style="margin:14px 0 8px 0;">Code Quality (Prettier Format Check)</h3>
-              <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(prettier)}</pre>
-
-              <h3 style="margin:14px 0 8px 0;">Security Summary (Trivy)</h3>
+              <h3 style="margin:14px 0 8px 0;">Security Summary (Trivy + Dependency-Check + Gitleaks)</h3>
               <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(vulnSummary)}</pre>
 
               <h3 style="margin:14px 0 8px 0;">Monitoring / Alerts Validation</h3>
               <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(monitorVal)}</pre>
 
               <p style="margin-top:12px;">
-                <b>Attachments included:</b> All reports under <code>reports/</code> (ESLint, Prettier, Trivy, Dependency-Check, Gitleaks, smoke test, monitoring validation, build summary).
+                <b>Attachments included:</b>
+                build-summary.txt, vuln-summary.txt, Trivy reports (txt/json), Dependency-Check (HTML/JSON), Gitleaks (JSON+note),
+                ESLint/Prettier reports, smoke-test.txt, monitoring validation notes.
               </p>
 
               <p style="color:#666; margin-top:16px;">
