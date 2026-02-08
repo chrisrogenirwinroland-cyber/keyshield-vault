@@ -1,14 +1,14 @@
-// Jenkinsfile (Windows-safe) — FULL pipeline, no empty stages
-// ✅ Clean SHA tag (no "unknown")
-// ✅ Trivy JSON reports + human summary + ZIP bundle
-// ✅ DockerHub push (credential-safe)
-// ✅ Staging deploy + smoke tests
-// ✅ Monitoring mount fix for Alertmanager + safe deploy + safe validation
-// ✅ Professional HTML email WITH ATTACHMENTS (ZIP + summary) + links
+// Jenkinsfile (Windows-safe) — FULL pipeline (no empty stages)
+// FIX: PowerShell blocks use ''' ''' so $null / $env:* never break Groovy parsing.
 //
-// IMPORTANT: Update credential IDs to match your Jenkins:
-// - DOCKER_CRED_ID
-// - SONAR_TOKEN_CRED_ID (optional, but stage is not empty even if unavailable)
+// Features:
+// ✅ Clean SHA tag (no "unknown")
+// ✅ Sonar stage safe (UNSTABLE if sonar-scanner/token missing)
+// ✅ Trivy JSON + human summary + ZIP bundle
+// ✅ DockerHub push
+// ✅ Staging deploy + smoke tests
+// ✅ Monitoring Alertmanager mount fix + safe deploy + safe validation
+// ✅ Professional HTML email WITH ATTACHMENTS + links
 
 pipeline {
   agent any
@@ -25,21 +25,22 @@ pipeline {
     EMAIL_TO       = "s225493677@deakin.edu.au"
 
     // Jenkins credential IDs (UPDATE to match your Jenkins)
-    DOCKER_CRED_ID      = "dockerhub-creds"      // Username with password
-    SONAR_TOKEN_CRED_ID = "sonarcloud-token"     // Secret text (optional)
+    DOCKER_CRED_ID      = "dockerhub-creds"     // Username with password
+    SONAR_TOKEN_CRED_ID = "sonarcloud-token"    // Secret text (optional)
 
-    // Sonar (optional)
+    // SonarCloud (optional)
     SONAR_HOST_URL    = "https://sonarcloud.io"
     SONAR_ORG         = "chrisrogenirwinroland-cyber"
     SONAR_PROJECT_KEY = "chrisrogenirwinroland-cyber_keyshield-vault"
     SONAR_DASHBOARD   = "https://sonarcloud.io/dashboard?id=chrisrogenirwinroland-cyber_keyshield-vault"
 
-    // Local endpoints
-    FE_URL          = "http://localhost:4200"
-    API_HEALTH_URL  = "http://localhost:3000/health"
-    PROM_READY_URL  = "http://localhost:9090/-/ready"
-    ALERT_URL       = "http://localhost:9093"
-    GRAFANA_URL     = "http://localhost:3001"
+    // Local endpoints (compose publishes these)
+    FE_URL         = "http://localhost:4200"
+    API_HEALTH_URL = "http://localhost:3000/health"
+
+    PROM_READY_URL = "http://localhost:9090/-/ready"
+    ALERT_URL      = "http://localhost:9093"
+    GRAFANA_URL    = "http://localhost:3001"
   }
 
   stages {
@@ -52,9 +53,11 @@ pipeline {
         echo Workspace: %CD%
         if not exist "reports" mkdir "reports"
         if not exist "reports\\logs" mkdir "reports\\logs"
+
         where git && git --version
         where docker && docker version
         where trivy && trivy --version
+
         echo ===== PREFLIGHT OK =====
         """
       }
@@ -87,22 +90,22 @@ pipeline {
           echo "WEB_IMAGE=${env.WEB_IMAGE}"
         }
 
-        powershell """
+        powershell '''
           @"
-Build: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-Commit: ${env.GIT_SHA}
-API Image: ${env.API_IMAGE}
-WEB Image: ${env.WEB_IMAGE}
-Build URL: ${env.BUILD_URL}
-Sonar: ${env.SONAR_DASHBOARD}
+Build: $env:JOB_NAME #$env:BUILD_NUMBER
+Commit: $env:GIT_SHA
+API Image: $env:API_IMAGE
+WEB Image: $env:WEB_IMAGE
+Build URL: $env:BUILD_URL
+Sonar: $env:SONAR_DASHBOARD
 "@ | Set-Content -Path "reports\\build-meta.txt" -Encoding UTF8
-        """
+        '''
       }
     }
 
     stage('3) Code Quality - Sonar (safe, never empty)') {
       steps {
-        // If Sonar token or sonar-scanner is missing, stage becomes UNSTABLE (not empty / not ignored)
+        // If token/scanner missing -> stage UNSTABLE, pipeline continues.
         catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
           withCredentials([string(credentialsId: "${env.SONAR_TOKEN_CRED_ID}", variable: 'SONAR_TOKEN')]) {
             bat """
@@ -110,7 +113,7 @@ Sonar: ${env.SONAR_DASHBOARD}
             echo ===== SONAR SCAN =====
             where sonar-scanner
             if %ERRORLEVEL% NEQ 0 (
-              echo sonar-scanner not found on PATH. Install SonarScanner OR keep this stage UNSTABLE.
+              echo sonar-scanner not found on PATH. Install SonarScanner to enable this stage.
               exit /b 1
             )
 
@@ -128,10 +131,12 @@ Sonar: ${env.SONAR_DASHBOARD}
           }
         }
 
-        powershell """
-          "Sonar Stage Result: ${currentBuild.currentResult}" | Set-Content -Path "reports\\sonar-note.txt" -Encoding UTF8
-          "Sonar Dashboard: ${env.SONAR_DASHBOARD}" | Add-Content -Path "reports\\sonar-note.txt" -Encoding UTF8
-        """
+        powershell '''
+          @"
+Sonar Stage completed (result may be UNSTABLE if sonar-scanner/token is missing).
+Dashboard: $env:SONAR_DASHBOARD
+"@ | Set-Content -Path "reports\\sonar-note.txt" -Encoding UTF8
+        '''
       }
     }
 
@@ -191,7 +196,7 @@ Sonar: ${env.SONAR_DASHBOARD}
 
     stage('8) Report - Summarise Trivy (human-readable)') {
       steps {
-        powershell """
+        powershell '''
           Write-Host "===== TRIVY SUMMARY ====="
 
           function Get-TrivyCounts($path) {
@@ -216,22 +221,22 @@ Sonar: ${env.SONAR_DASHBOARD}
 
           @"
 Trivy Summary (HIGH/CRITICAL)
-Build: ${env.JOB_NAME} #${env.BUILD_NUMBER}
-Commit: ${env.GIT_SHA}
+Build: $env:JOB_NAME #$env:BUILD_NUMBER
+Commit: $env:GIT_SHA
 
-API Image: ${env.API_IMAGE}
+API Image: $env:API_IMAGE
   Total:     $($api.Total)
   HIGH:      $($api.High)
   CRITICAL:  $($api.Critical)
 
-WEB Image: ${env.WEB_IMAGE}
+WEB Image: $env:WEB_IMAGE
   Total:     $($web.Total)
   HIGH:      $($web.High)
   CRITICAL:  $($web.Critical)
 "@ | Set-Content -Path "reports\\trivy-summary.txt" -Encoding UTF8
 
           Get-Content "reports\\trivy-summary.txt"
-        """
+        '''
       }
     }
 
@@ -261,6 +266,7 @@ WEB Image: ${env.WEB_IMAGE}
         bat """
         @echo off
         echo ===== DEPLOY STAGING =====
+
         docker rm -f keyshield-api 2>NUL || echo No old keyshield-api
         docker rm -f keyshield-frontend 2>NUL || echo No old keyshield-frontend
 
@@ -275,31 +281,30 @@ WEB Image: ${env.WEB_IMAGE}
 
     stage('11) Release - Smoke / Health Validation') {
       steps {
-        powershell """
+        powershell '''
           Write-Host "===== RELEASE SMOKE TEST ====="
-          $fe = Invoke-WebRequest '${env.FE_URL}' -UseBasicParsing -TimeoutSec 30
+          $fe = Invoke-WebRequest $env:FE_URL -UseBasicParsing -TimeoutSec 30
           Write-Host ("FE Status: " + $fe.StatusCode)
 
-          $api = Invoke-WebRequest '${env.API_HEALTH_URL}' -UseBasicParsing -TimeoutSec 30
+          $api = Invoke-WebRequest $env:API_HEALTH_URL -UseBasicParsing -TimeoutSec 30
           Write-Host ("API /health Status: " + $api.StatusCode)
 
           @"
 Smoke Test
-Frontend: ${env.FE_URL} -> $($fe.StatusCode)
-API Health: ${env.API_HEALTH_URL} -> $($api.StatusCode)
+Frontend: $env:FE_URL -> $($fe.StatusCode)
+API Health: $env:API_HEALTH_URL -> $($api.StatusCode)
 "@ | Set-Content -Path "reports\\smoke-test.txt" -Encoding UTF8
-        """
+        '''
       }
     }
 
     stage('12) Monitoring - Prepare Alertmanager Config (mount fix)') {
       steps {
-        // Safe: stage always does something (writes a note), even if monitoring compose is missing
-        powershell """
+        powershell '''
           Write-Host "===== MONITORING PREP ====="
 
           if (-not (Test-Path 'docker-compose.monitoring.yml' -PathType Leaf)) {
-            "Monitoring compose file missing (docker-compose.monitoring.yml). Monitoring deploy will be skipped." |
+            "Monitoring compose missing (docker-compose.monitoring.yml). Monitoring deploy will be skipped." |
               Set-Content -Path "reports\\monitoring-note.txt" -Encoding UTF8
             Write-Host "docker-compose.monitoring.yml not found."
             exit 0
@@ -326,15 +331,14 @@ receivers:
           }
 
           "Alertmanager config ready: $amPath" | Set-Content -Path "reports\\monitoring-note.txt" -Encoding UTF8
-        """
+        '''
       }
     }
 
     stage('13) Monitoring - Deploy Stack (safe)') {
       steps {
-        // Monitoring is OPTIONAL for grading; if it fails, mark UNSTABLE but continue
         catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-          powershell """
+          powershell '''
             Write-Host "===== MONITORING DEPLOY ====="
             if (-not (Test-Path 'docker-compose.monitoring.yml' -PathType Leaf)) {
               Write-Host "docker-compose.monitoring.yml not found - no deploy performed."
@@ -345,21 +349,21 @@ receivers:
 
             docker ps | findstr monitoring > reports\\docker-ps-monitoring.txt
             Get-Content reports\\docker-ps-monitoring.txt
-          """
+          '''
         }
       }
     }
 
-    stage('14) Monitoring - Validate (Prometheus Ready + Alertmanager Reachable)') {
+    stage('14) Monitoring - Validate (Prometheus + Alertmanager)') {
       steps {
         catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-          powershell """
+          powershell '''
             Write-Host "===== MONITORING VALIDATION ====="
 
             $promOk = $false
             for ($i=1; $i -le 8; $i++) {
               try {
-                $r = Invoke-WebRequest '${env.PROM_READY_URL}' -UseBasicParsing -TimeoutSec 10
+                $r = Invoke-WebRequest $env:PROM_READY_URL -UseBasicParsing -TimeoutSec 10
                 if ($r.StatusCode -eq 200) {
                   Write-Host "Prometheus READY (200) on attempt $i"
                   $promOk = $true
@@ -373,7 +377,7 @@ receivers:
 
             $amCode = "N/A"
             try {
-              $a = Invoke-WebRequest '${env.ALERT_URL}' -UseBasicParsing -TimeoutSec 10
+              $a = Invoke-WebRequest $env:ALERT_URL -UseBasicParsing -TimeoutSec 10
               $amCode = $a.StatusCode
               Write-Host ("Alertmanager Status: " + $amCode)
             } catch {
@@ -382,11 +386,11 @@ receivers:
 
             @"
 Monitoring Validation
-Prometheus Ready: $promOk  (${env.PROM_READY_URL})
-Alertmanager: $amCode      (${env.ALERT_URL})
-Grafana: ${env.GRAFANA_URL}
+Prometheus Ready: $promOk  ($env:PROM_READY_URL)
+Alertmanager: $amCode      ($env:ALERT_URL)
+Grafana: $env:GRAFANA_URL
 "@ | Set-Content -Path "reports\\monitoring-validation.txt" -Encoding UTF8
-          """
+          '''
         }
       }
     }
@@ -409,45 +413,42 @@ Grafana: ${env.GRAFANA_URL}
 
     stage('16) Package Reports (ZIP)') {
       steps {
-        powershell """
+        powershell '''
           Write-Host "===== PACKAGE REPORTS ====="
 
-          # Build summary (single file marker report)
           @"
 Build Summary
 ============
-Job: ${env.JOB_NAME}
-Build: #${env.BUILD_NUMBER}
-Commit: ${env.GIT_SHA}
+Job: $env:JOB_NAME
+Build: #$env:BUILD_NUMBER
+Commit: $env:GIT_SHA
 
 Images
-- ${env.API_IMAGE}
-- ${env.WEB_IMAGE}
+- $env:API_IMAGE
+- $env:WEB_IMAGE
 
 Links
-- Build: ${env.BUILD_URL}
-- Artifacts: ${env.BUILD_URL}artifact/
-- Sonar: ${env.SONAR_DASHBOARD}
+- Build: $env:BUILD_URL
+- Artifacts: $($env:BUILD_URL)artifact/
+- Sonar: $env:SONAR_DASHBOARD
 
 Endpoints
-- Frontend: ${env.FE_URL}
-- API /health: ${env.API_HEALTH_URL}
+- Frontend: $env:FE_URL
+- API /health: $env:API_HEALTH_URL
 - Prometheus: http://localhost:9090
-- Grafana: ${env.GRAFANA_URL}
+- Grafana: $env:GRAFANA_URL
 "@ | Set-Content -Path "reports\\build-summary.txt" -Encoding UTF8
 
-          # ZIP bundle for email attachment
           if (Test-Path "reports\\security-reports.zip") { Remove-Item "reports\\security-reports.zip" -Force }
           Compress-Archive -Path "reports\\*" -DestinationPath "reports\\security-reports.zip" -Force
 
           Write-Host "Created reports\\security-reports.zip"
-        """
+        '''
       }
     }
 
     stage('17) Archive Artifacts (reports/**)') {
       steps {
-        echo "Archiving reports as Jenkins artifacts..."
         archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
       }
     }
@@ -464,81 +465,45 @@ Endpoints
           to: "${env.EMAIL_TO}",
           subject: subject,
           mimeType: 'text/html',
-          // Attachments you said you want (ZIP contains ALL reports + logs)
           attachmentsPattern: 'reports/security-reports.zip,reports/build-summary.txt',
           body: """
           <html>
             <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
               <h2 style="margin:0 0 10px 0;">CI/CD Pipeline Result: <span style="color:#1a7f37;">SUCCESS</span></h2>
-              <p style="margin:0 0 12px 0;">
-                The build completed successfully. Reports and evidence are attached and also available as Jenkins artifacts.
-              </p>
+              <p style="margin:0 0 12px 0;">Build completed successfully. Security and evidence reports are attached.</p>
 
               <table cellpadding="8" cellspacing="0" style="border-collapse:collapse; border:1px solid #ddd;">
-                <tr>
-                  <td style="border:1px solid #ddd;"><b>Application</b></td>
-                  <td style="border:1px solid #ddd;">${env.APP_NAME}</td>
-                </tr>
-                <tr>
-                  <td style="border:1px solid #ddd;"><b>Job</b></td>
-                  <td style="border:1px solid #ddd;">${env.JOB_NAME}</td>
-                </tr>
-                <tr>
-                  <td style="border:1px solid #ddd;"><b>Build</b></td>
-                  <td style="border:1px solid #ddd;">#${env.BUILD_NUMBER}</td>
-                </tr>
-                <tr>
-                  <td style="border:1px solid #ddd;"><b>Commit</b></td>
-                  <td style="border:1px solid #ddd;">${env.GIT_SHA}</td>
-                </tr>
-                <tr>
-                  <td style="border:1px solid #ddd;"><b>Build URL</b></td>
-                  <td style="border:1px solid #ddd;"><a href="${env.BUILD_URL}">${env.BUILD_URL}</a></td>
-                </tr>
-                <tr>
-                  <td style="border:1px solid #ddd;"><b>Artifacts</b></td>
-                  <td style="border:1px solid #ddd;"><a href="${artifactsUrl}">${artifactsUrl}</a></td>
-                </tr>
-                <tr>
-                  <td style="border:1px solid #ddd;"><b>Reports ZIP</b></td>
-                  <td style="border:1px solid #ddd;"><a href="${zipUrl}">${zipUrl}</a></td>
-                </tr>
+                <tr><td style="border:1px solid #ddd;"><b>Application</b></td><td style="border:1px solid #ddd;">${env.APP_NAME}</td></tr>
+                <tr><td style="border:1px solid #ddd;"><b>Job</b></td><td style="border:1px solid #ddd;">${env.JOB_NAME}</td></tr>
+                <tr><td style="border:1px solid #ddd;"><b>Build</b></td><td style="border:1px solid #ddd;">#${env.BUILD_NUMBER}</td></tr>
+                <tr><td style="border:1px solid #ddd;"><b>Commit</b></td><td style="border:1px solid #ddd;">${env.GIT_SHA}</td></tr>
+                <tr><td style="border:1px solid #ddd;"><b>Build URL</b></td><td style="border:1px solid #ddd;"><a href="${env.BUILD_URL}">${env.BUILD_URL}</a></td></tr>
+                <tr><td style="border:1px solid #ddd;"><b>Artifacts</b></td><td style="border:1px solid #ddd;"><a href="${artifactsUrl}">${artifactsUrl}</a></td></tr>
+                <tr><td style="border:1px solid #ddd;"><b>Reports ZIP</b></td><td style="border:1px solid #ddd;"><a href="${zipUrl}">${zipUrl}</a></td></tr>
 
-                <tr>
-                  <td style="border:1px solid #ddd;"><b>Docker Images</b></td>
-                  <td style="border:1px solid #ddd;">
-                    <div>${env.API_IMAGE}</div>
-                    <div>${env.WEB_IMAGE}</div>
-                  </td>
-                </tr>
+                <tr><td style="border:1px solid #ddd;"><b>Docker Images</b></td>
+                    <td style="border:1px solid #ddd;">
+                      <div>${env.API_IMAGE}</div>
+                      <div>${env.WEB_IMAGE}</div>
+                    </td></tr>
 
-                <tr>
-                  <td style="border:1px solid #ddd;"><b>Deployed Endpoints</b></td>
-                  <td style="border:1px solid #ddd;">
-                    <div>Frontend: <a href="${env.FE_URL}">${env.FE_URL}</a></div>
-                    <div>API /health: <a href="${env.API_HEALTH_URL}">${env.API_HEALTH_URL}</a></div>
-                    <div>Prometheus: <a href="http://localhost:9090">http://localhost:9090</a></div>
-                    <div>Grafana: <a href="${env.GRAFANA_URL}">${env.GRAFANA_URL}</a></div>
-                  </td>
-                </tr>
+                <tr><td style="border:1px solid #ddd;"><b>Deployed Endpoints</b></td>
+                    <td style="border:1px solid #ddd;">
+                      <div>Frontend: <a href="${env.FE_URL}">${env.FE_URL}</a></div>
+                      <div>API /health: <a href="${env.API_HEALTH_URL}">${env.API_HEALTH_URL}</a></div>
+                      <div>Prometheus: <a href="http://localhost:9090">http://localhost:9090</a></div>
+                      <div>Grafana: <a href="${env.GRAFANA_URL}">${env.GRAFANA_URL}</a></div>
+                    </td></tr>
 
-                <tr>
-                  <td style="border:1px solid #ddd;"><b>Sonar Dashboard</b></td>
-                  <td style="border:1px solid #ddd;"><a href="${env.SONAR_DASHBOARD}">${env.SONAR_DASHBOARD}</a></td>
-                </tr>
+                <tr><td style="border:1px solid #ddd;"><b>SonarCloud</b></td>
+                    <td style="border:1px solid #ddd;"><a href="${env.SONAR_DASHBOARD}">${env.SONAR_DASHBOARD}</a></td></tr>
               </table>
 
               <p style="margin-top:12px;">
-                <b>Attachments included:</b>
-                <ul>
-                  <li><b>security-reports.zip</b> (Trivy JSON, Trivy summary, logs, smoke test, monitoring checks)</li>
-                  <li><b>build-summary.txt</b> (quick overview)</li>
-                </ul>
+                <b>Attachments:</b> security-reports.zip (Trivy JSON + summary + logs), build-summary.txt
               </p>
 
-              <p style="color:#666; margin-top:16px;">
-                Generated automatically by Jenkins (Email Extension).
-              </p>
+              <p style="color:#666; margin-top:16px;">Generated automatically by Jenkins.</p>
             </body>
           </html>
           """
@@ -559,14 +524,8 @@ Endpoints
           <html>
             <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
               <h2 style="margin:0 0 10px 0;">CI/CD Pipeline Result: <span style="color:#b42318;">FAILED</span></h2>
-              <p style="margin:0 0 12px 0;">
-                The build failed. Jenkins console log is attached (if enabled) and any generated reports are attached when available.
-              </p>
-              <p>
-                <b>Job:</b> ${env.JOB_NAME}<br/>
-                <b>Build:</b> #${env.BUILD_NUMBER}<br/>
-                <b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a>
-              </p>
+              <p>Build failed. Console log and any available reports are attached.</p>
+              <p><b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
             </body>
           </html>
           """
@@ -575,7 +534,6 @@ Endpoints
     }
 
     always {
-      // Always show final container state in console + keep one simple evidence file
       bat """
       @echo off
       echo ===== POST: FINAL DOCKER PS =====
