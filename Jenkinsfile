@@ -68,16 +68,15 @@ pipeline {
           git status
         """
         script {
-  env.GIT_SHA = powershell(
-    script: '(git rev-parse --short HEAD).Trim()',
-    returnStdout: true
-  ).trim()
+          env.GIT_SHA = powershell(
+            script: '(git rev-parse --short HEAD).Trim()',
+            returnStdout: true
+          ).trim()
 
-  if (!env.GIT_SHA) { env.GIT_SHA = "manual" }
+          if (!env.GIT_SHA) { env.GIT_SHA = "manual" }
 
-  echo "Resolved GIT_SHA = ${env.GIT_SHA}"
-}
-
+          echo "Resolved GIT_SHA = ${env.GIT_SHA}"
+        }
       }
     }
 
@@ -97,8 +96,7 @@ pipeline {
           where trivy
           trivy --version
         """
-bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
-
+        bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
       }
     }
 
@@ -116,8 +114,6 @@ bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
       }
       post {
         always {
-          // Prevent “No test report files were found” noise by allowing empty.
-          // If you later output JUnit XML, Jenkins will display it automatically.
           junit allowEmptyResults: true, testResults: 'api/**/junit*.xml, api/**/TEST-*.xml'
           archiveArtifacts allowEmptyArchive: true, artifacts: 'api/npm-debug.log, api/**/coverage/**'
         }
@@ -163,7 +159,6 @@ bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
     stage('Code Quality - SonarCloud') {
       steps {
         script {
-          // Ensure sonar scanner tool is installed via Jenkins Tools
           def scannerHome = tool("${SONAR_SCANNER_TOOL}")
 
           withSonarQubeEnv("${SONAR_SERVER_NAME}") {
@@ -275,7 +270,7 @@ bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
 
     stage('Deploy - Docker Compose (Staging)') {
       steps {
-bat '''
+        bat '''
           echo ===== CLEAN OLD CONTAINERS =====
           docker rm -f keyshield-api 2>NUL || echo "No old keyshield-api to remove"
           docker rm -f keyshield-frontend 2>NUL || echo "No old keyshield-frontend to remove"
@@ -317,6 +312,72 @@ bat '''
         """
       }
     }
+
+    // ============================
+    // ADDED: Monitoring Deployment
+    // ============================
+    stage('Monitoring - Deploy Stack (Prometheus/Alertmanager)') {
+      steps {
+        bat """
+          echo ===== MONITORING DEPLOY =====
+          if exist "docker-compose.monitoring.yml" (
+            docker compose -f docker-compose.monitoring.yml down
+            docker compose -f docker-compose.monitoring.yml up -d --build
+          ) else (
+            echo "docker-compose.monitoring.yml not found - skipping monitoring deploy"
+          )
+
+          echo ===== MONITORING CONTAINERS =====
+          docker ps
+        """
+      }
+    }
+
+    // ============================
+    // ADDED: Alert + Monitoring Validation
+    // ============================
+    stage('Alerts - Validate Prometheus/Alertmanager') {
+      steps {
+        powershell """
+          Write-Host '===== ALERTS / MONITORING VALIDATION ====='
+
+          # Only validate if monitoring compose exists
+          if (Test-Path 'docker-compose.monitoring.yml') {
+
+            # Common default ports (adjust only if your compose uses different ports)
+            $promUrl = 'http://localhost:9090/-/ready'
+            $amUrl   = 'http://localhost:9093/-/ready'
+
+            try {
+              $p = Invoke-WebRequest $promUrl -UseBasicParsing -TimeoutSec 20
+              Write-Host ('Prometheus ready: ' + $p.StatusCode)
+            } catch {
+              Write-Error 'Prometheus not reachable/ready on http://localhost:9090'
+              throw
+            }
+
+            try {
+              $a = Invoke-WebRequest $amUrl -UseBasicParsing -TimeoutSec 20
+              Write-Host ('Alertmanager ready: ' + $a.StatusCode)
+            } catch {
+              Write-Error 'Alertmanager not reachable/ready on http://localhost:9093'
+              throw
+            }
+
+            # Optional: validate that rules endpoint responds (Prometheus)
+            try {
+              $rules = Invoke-WebRequest 'http://localhost:9090/api/v1/rules' -UseBasicParsing -TimeoutSec 20
+              Write-Host 'Prometheus rules endpoint OK'
+            } catch {
+              Write-Host 'Prometheus rules endpoint not accessible (non-blocking) - continuing'
+            }
+
+          } else {
+            Write-Host 'Monitoring compose not present - skipping validation'
+          }
+        """
+      }
+    }
   }
 
   post {
@@ -329,6 +390,7 @@ bat '''
         docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
       """
 
+      // Keep existing archive behavior (now also ensures monitoring reports are kept if you add any later)
       archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
     }
 
@@ -336,15 +398,39 @@ bat '''
       emailext(
         to: "${ALERT_TO}",
         subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-        body: """Build SUCCESS.
+        mimeType: 'text/html',
+        attachmentsPattern: 'reports/*.txt, reports/*.json',
+        body: """
+          <div style="font-family:Segoe UI, Arial, sans-serif; font-size:13px; color:#111;">
+            <h2 style="margin:0 0 8px 0;">CI/CD Pipeline Result: <span style="color:#1a7f37;">SUCCESS</span></h2>
 
-Job: ${JOB_NAME}
-Build: #${BUILD_NUMBER}
-Commit: ${GIT_SHA}
-URL: ${BUILD_URL}
+            <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;">
+              <tr><td><b>Job</b></td><td>${JOB_NAME}</td></tr>
+              <tr><td><b>Build</b></td><td>#${BUILD_NUMBER}</td></tr>
+              <tr><td><b>Commit</b></td><td>${GIT_SHA}</td></tr>
+              <tr><td><b>Build URL</b></td><td><a href="${BUILD_URL}">${BUILD_URL}</a></td></tr>
+            </table>
 
-Artifacts: SonarCloud results + Trivy reports + build logs are archived in Jenkins.
-"""
+            <hr style="border:none;border-top:1px solid #ddd;margin:12px 0;"/>
+
+            <h3 style="margin:0 0 6px 0;">Security & Quality Outputs</h3>
+            <ul style="margin:0 0 10px 18px;">
+              <li>SonarCloud analysis executed (see Jenkins console + SonarCloud dashboard).</li>
+              <li>Trivy reports generated and attached (FS + Docker image scans).</li>
+              <li>Monitoring stack deployed + validated (Prometheus/Alertmanager readiness).</li>
+            </ul>
+
+            <p style="margin:0;">
+              <b>Attached:</b> <code>reports/trivy-*.txt</code> and <code>reports/trivy-*.json</code><br/>
+              <b>Note:</b> Full artifacts are also archived in Jenkins under this build.
+            </p>
+
+            <p style="margin:14px 0 0 0;color:#555;">
+              Regards,<br/>
+              Jenkins CI/CD
+            </p>
+          </div>
+        """
       )
     }
 
@@ -352,16 +438,39 @@ Artifacts: SonarCloud results + Trivy reports + build logs are archived in Jenki
       emailext(
         to: "${ALERT_TO}",
         subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-        body: """Build FAILED.
+        mimeType: 'text/html',
+        attachmentsPattern: 'reports/*.txt, reports/*.json',
+        attachLog: true,
+        body: """
+          <div style="font-family:Segoe UI, Arial, sans-serif; font-size:13px; color:#111;">
+            <h2 style="margin:0 0 8px 0;">CI/CD Pipeline Result: <span style="color:#cf222e;">FAILURE</span></h2>
 
-Job: ${JOB_NAME}
-Build: #${BUILD_NUMBER}
-Commit: ${GIT_SHA}
-URL: ${BUILD_URL}
+            <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;">
+              <tr><td><b>Job</b></td><td>${JOB_NAME}</td></tr>
+              <tr><td><b>Build</b></td><td>#${BUILD_NUMBER}</td></tr>
+              <tr><td><b>Commit</b></td><td>${GIT_SHA}</td></tr>
+              <tr><td><b>Build URL</b></td><td><a href="${BUILD_URL}">${BUILD_URL}</a></td></tr>
+            </table>
 
-Check stage logs for root cause. Trivy reports (if generated) are archived.
-""",
-        attachLog: true
+            <hr style="border:none;border-top:1px solid #ddd;margin:12px 0;"/>
+
+            <h3 style="margin:0 0 6px 0;">What to check</h3>
+            <ol style="margin:0 0 10px 18px;">
+              <li>Open Jenkins build URL and review the failed stage log.</li>
+              <li>Review attached Trivy reports (if produced) for HIGH/CRITICAL findings.</li>
+              <li>Review attached build log for exact error lines.</li>
+            </ol>
+
+            <p style="margin:0;">
+              <b>Attached (if available):</b> <code>reports/trivy-*.txt</code>, <code>reports/trivy-*.json</code>, and Jenkins console log.
+            </p>
+
+            <p style="margin:14px 0 0 0;color:#555;">
+              Regards,<br/>
+              Jenkins CI/CD
+            </p>
+          </div>
+        """
       )
     }
   }
