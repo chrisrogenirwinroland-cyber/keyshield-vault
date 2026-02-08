@@ -674,8 +674,6 @@ Grafana:    $env:GRAFANA_URL
       }
     }
   } // نهاية stages
-
-// ✅ REPLACE your entire:  post { ... }  block with THIS one
 post {
   always {
     bat """
@@ -690,34 +688,32 @@ post {
 
   success {
     script {
-      // ---------- Safe file read ----------
+      // ---- Safe read (no "file not found" break) ----
       def readSafe = { p, fb -> fileExists(p) ? readFile(p) : fb }
 
-      // ---------- Clip long outputs ----------
+      // ---- Clip long text blocks to keep email readable ----
       def clip = { s, n ->
         def x = (s ?: '')
         (x.length() > n) ? (x.substring(0, n) + "\n...[clipped]...") : x
       }
 
-      // ---------- Remove BOM + ANSI (fix ï»¿ and "encrypted" [33m codes) ----------
+      // ---- Fix ï»¿ (BOM) + remove ANSI escape color codes ([33m etc) ----
       def deBom = { s ->
         (s ?: '')
-          .replace('\uFEFF', '')  // real BOM char
-          .replace('ï»¿', '')      // BOM rendered as mojibake
+          .replace('\uFEFF', '') // real BOM char
+          .replace('ï»¿', '')     // BOM rendered as mojibake
       }
 
       def stripAnsi = { s ->
         def x = (s ?: '')
-        // CSI escape sequences
-        x = x.replaceAll(/\u001B\[[0-9;?]*[ -\/]*[@-~]/, '')
-        // Single-character CSI (rare)
-        x = x.replaceAll(/\u009B[0-9;?]*[ -\/]*[@-~]/, '')
+        x = x.replaceAll(/\u001B\[[0-9;?]*[ -\/]*[@-~]/, '') // CSI
+        x = x.replaceAll(/\u009B[0-9;?]*[ -\/]*[@-~]/, '')   // single-byte CSI (rare)
         return x
       }
 
       def clean = { s -> stripAnsi(deBom(s)) }
 
-      // ---------- HTML escape (after cleaning) ----------
+      // ---- HTML escape (after cleaning) ----
       def esc = { s ->
         (s ?: '')
           .replace("&", "&amp;")
@@ -725,20 +721,20 @@ post {
           .replace(">", "&gt;")
       }
 
-      // ---------- Load report snippets ----------
+      // ---- Load report snippets (cleaned) ----
       def buildSum    = clean(readSafe('reports/build-summary.txt', 'No build-summary.txt generated.'))
       def vulnSummary = clean(readSafe('reports/vuln-summary.txt',  'No vuln-summary.txt generated.'))
       def smoke       = clean(readSafe('reports/smoke-test.txt',    'No smoke-test.txt generated.'))
       def monitorVal  = clean(readSafe('reports/alerts-validation.txt', 'No alerts-validation.txt generated.'))
 
-      def eslintApi   = clean(readSafe('reports/eslint/eslint-api.txt', 'No ESLint API output.'))
-      def eslintFe    = clean(readSafe('reports/eslint/eslint-fe.txt',  'No ESLint Frontend output.'))
+      def eslintApi   = clean(readSafe('reports/eslint/eslint-api.txt', 'No ESLint API output (lint script missing or produced no file).'))
+      def eslintFe    = clean(readSafe('reports/eslint/eslint-fe.txt',  'No ESLint Frontend output (lint script missing or produced no file).'))
       def prettier    = clean(readSafe('reports/prettier/prettier-check.txt', 'No Prettier output.'))
 
       def dcNote      = clean(readSafe('reports/dependency-check/dependency-check-note.txt',
                                        'No dependency-check-note.txt (see reports/dependency-check/).'))
 
-      // ---------- Keep attachments (but REMOVE the "Attachments included" section from email body) ----------
+      // ---- Attachments STILL sent (only removed the "Attachments included" TEXT section from email body) ----
       def attachments = [
         'reports/build-summary.txt',
         'reports/vuln-summary.txt',
@@ -757,7 +753,7 @@ post {
 
       emailext(
         to: "${ALERT_TO}",
-        subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+        subject: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.GIT_SHA})",
         mimeType: 'text/html; charset=UTF-8',
         attachmentsPattern: attachments,
         body: """
@@ -766,30 +762,16 @@ post {
 <head><meta charset="UTF-8"></head>
 <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222; line-height:1.35;">
 
-  <div style="margin-bottom:10px;">
-    <h2 style="margin:0 0 8px 0;">
-      CI/CD Pipeline Result:
-      <span style="color:#1a7f37; font-weight:700;">SUCCESS</span>
-    </h2>
-  </div>
+  <h2 style="margin:0 0 10px 0;">
+    CI/CD Pipeline Result:
+    <span style="color:#1a7f37; font-weight:700;">SUCCESS</span>
+  </h2>
 
   <table cellpadding="8" cellspacing="0" style="border-collapse:collapse; border:1px solid #ddd; width:100%; max-width:820px;">
-    <tr>
-      <td style="border:1px solid #ddd; width:140px;"><b>Job</b></td>
-      <td style="border:1px solid #ddd;">${JOB_NAME}</td>
-    </tr>
-    <tr>
-      <td style="border:1px solid #ddd;"><b>Build</b></td>
-      <td style="border:1px solid #ddd;">#${BUILD_NUMBER}</td>
-    </tr>
-    <tr>
-      <td style="border:1px solid #ddd;"><b>Commit</b></td>
-      <td style="border:1px solid #ddd;">${GIT_SHA}</td>
-    </tr>
-    <tr>
-      <td style="border:1px solid #ddd;"><b>Build URL</b></td>
-      <td style="border:1px solid #ddd;"><a href="${BUILD_URL}">${BUILD_URL}</a></td>
-    </tr>
+    <tr><td style="border:1px solid #ddd; width:140px;"><b>Job</b></td><td style="border:1px solid #ddd;">${env.JOB_NAME}</td></tr>
+    <tr><td style="border:1px solid #ddd;"><b>Build</b></td><td style="border:1px solid #ddd;">#${env.BUILD_NUMBER}</td></tr>
+    <tr><td style="border:1px solid #ddd;"><b>Commit</b></td><td style="border:1px solid #ddd;">${env.GIT_SHA}</td></tr>
+    <tr><td style="border:1px solid #ddd;"><b>Build URL</b></td><td style="border:1px solid #ddd;"><a href="${env.BUILD_URL}">${env.BUILD_URL}</a></td></tr>
     <tr>
       <td style="border:1px solid #ddd;"><b>SonarCloud</b></td>
       <td style="border:1px solid #ddd;">
@@ -840,7 +822,7 @@ post {
   failure {
     emailext(
       to: "${ALERT_TO}",
-      subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+      subject: "FAILURE: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.GIT_SHA})",
       mimeType: 'text/html; charset=UTF-8',
       attachmentsPattern: 'reports/**',
       attachLog: true,
@@ -854,12 +836,12 @@ post {
     <span style="color:#b42318; font-weight:700;">FAILED</span>
   </h2>
   <p style="margin:0 0 10px 0;">
-    <b>Job:</b> ${JOB_NAME}<br/>
-    <b>Build:</b> #${BUILD_NUMBER}<br/>
-    <b>Commit:</b> ${GIT_SHA}<br/>
-    <b>Build URL:</b> <a href="${BUILD_URL}">${BUILD_URL}</a>
+    <b>Job:</b> ${env.JOB_NAME}<br/>
+    <b>Build:</b> #${env.BUILD_NUMBER}<br/>
+    <b>Commit:</b> ${env.GIT_SHA}<br/>
+    <b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a>
   </p>
-  <p style="margin:0 0 10px 0;">Console log attached. Any generated reports are attached/archived under Jenkins artifacts.</p>
+  <p style="margin:0 0 10px 0;">Console log attached. Reports (if generated) are archived in Jenkins.</p>
   <p style="color:#666; margin-top:16px;">
     Regards,<br/>
     Jenkins CI/CD Pipeline<br/>
