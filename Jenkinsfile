@@ -1,14 +1,26 @@
 // Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, Docker, Email alerts)
+// FIXED:
+// - Dependency-Check format args (no "HTML,JSON"; use separate formats)
+// - Dependency-Check + Gitleaks run in PowerShell (avoids cmd ". was unexpected at this time.")
+// - GIT_SHA resolved from env.GIT_COMMIT (reliable), fallback to git rev-parse
 //
-// FIXES included (your current failure: ". was unexpected at this time."):
-// - ESLint/Prettier stage is implemented in PowerShell (no CMD parser edge-cases), and is NON-BLOCKING.
-// - GIT_SHA resolution uses a Windows-safe `bat(returnStdout:true, ...)` method (no "unknown").
+// Repo layout:
+//  - api/package.json, api/package-lock.json, api/Dockerfile
+//  - frontend/app/package.json, frontend/app/package-lock.json, frontend/app/Dockerfile
+//  - docker-compose.yml at repo root
 //
-// Adds requested stages:
-// 1) Code Quality - ESLint/Prettier  (after Install & Unit Tests)
-// 2) Security - Dependency-Check     (near Trivy)
-// 3) Security - Gitleaks (Secrets Scan) (near Trivy)
-
+// Jenkins requirements:
+//  - SonarQube Scanner tool configured in Jenkins as: "SonarQubeScanner"
+//  - SonarCloud server configured in Jenkins as: "SonarCloud"
+//  - Credentials:
+//      * sonar-token (Secret text)  -> SonarCloud token
+//      * dockerhub-creds (Username/Password) -> DockerHub
+//  - Email Extension Plugin configured (SMTP) + Admin email
+//
+// IMPORTANT: Trivy must be visible to Jenkins service PATH.
+// If "trivy not recognized", restart Jenkins service OR set PATH to include:
+//   C:\ProgramData\chocolatey\bin
+//
 pipeline {
   agent any
 
@@ -21,31 +33,34 @@ pipeline {
   }
 
   environment {
+    // ========= App / traceability =========
     APP_NAME  = "keyshield-vault"
     GIT_SHA   = "unknown"
 
-    // Docker Hub
+    // ========= Docker Hub =========
     DOCKERHUB_NAMESPACE = "rogen7spark"
     DOCKERHUB_CREDS_ID  = "dockerhub-creds"
 
-    // SonarCloud
-    SONAR_SERVER_NAME  = "SonarCloud"
-    SONAR_SCANNER_TOOL = "SonarQubeScanner"
-    SONAR_TOKEN_ID     = "sonar-token"
-    SONAR_ORG          = "chrisrogenirwinroland-cyber"
-    SONAR_PROJECT_KEY  = "chrisrogenirwinroland-cyber_keyshield-vault"
+    // ========= SonarCloud =========
+    SONAR_SERVER_NAME   = "SonarCloud"
+    SONAR_SCANNER_TOOL  = "SonarQubeScanner"
+    SONAR_TOKEN_ID      = "sonar-token"
+    SONAR_ORG           = "chrisrogenirwinroland-cyber"
+    SONAR_PROJECT_KEY   = "chrisrogenirwinroland-cyber_keyshield-vault"
 
-    // Email
+    // ========= Email =========
     ALERT_TO = "s225493677@deakin.edu.au"
 
-    // Endpoints
+    // ========= Release / smoke =========
     FE_URL  = "http://localhost:4200"
     API_URL = "http://localhost:3000"
 
+    // ========= Monitoring endpoints =========
     PROM_READY_URL = "http://localhost:9090/-/ready"
     ALERTMGR_URL   = "http://localhost:9093"
     GRAFANA_URL    = "http://localhost:3001"
 
+    // ========= Reports =========
     REPORT_DIR = "reports"
   }
 
@@ -63,9 +78,13 @@ pipeline {
           git status
         """
         script {
-          // Windows-safe commit capture (avoids "unknown")
-          def raw = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short HEAD\r\n').trim()
-          env.GIT_SHA = raw?.tokenize()?.last()
+          // Prefer Git plugin var (most reliable)
+          if (env.GIT_COMMIT) {
+            env.GIT_SHA = env.GIT_COMMIT.take(7)
+          } else {
+            def sha = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short HEAD\r\n').trim()
+            env.GIT_SHA = sha?.tokenize()?.last()
+          }
           if (!env.GIT_SHA) { env.GIT_SHA = "manual" }
           echo "Resolved GIT_SHA = ${env.GIT_SHA}"
         }
@@ -80,6 +99,14 @@ pipeline {
           where node
           node -v
           npm -v
+
+          echo ===== DOCKER =====
+          where docker
+          docker version
+
+          echo ===== TRIVY =====
+          where trivy
+          trivy --version
 
           echo ===== SETUP REPORT DIR =====
           if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
@@ -140,10 +167,7 @@ pipeline {
     }
 
     // ==========================================================
-    // NEW STAGE (FIXED): Code Quality - ESLint/Prettier
-    // - Implemented in PowerShell to avoid CMD error:
-    //   ". was unexpected at this time."
-    // - NON-BLOCKING by design (always exits 0)
+    // CODE QUALITY (after Install & Unit Tests)
     // ==========================================================
     stage('Code Quality - ESLint/Prettier') {
       steps {
@@ -154,14 +178,12 @@ pipeline {
           $root = Join-Path $env:WORKSPACE $env:REPORT_DIR
           $eslintDir   = Join-Path $root "eslint"
           $prettierDir = Join-Path $root "prettier"
-
           New-Item -ItemType Directory -Force $eslintDir   | Out-Null
           New-Item -ItemType Directory -Force $prettierDir | Out-Null
 
           function Run-And-Capture([string]$workDir, [string]$cmd, [string]$outFile) {
             Push-Location $workDir
             try {
-              # Run command and capture ALL output (stdout+stderr)
               cmd /c $cmd 2>&1 | Out-File -FilePath $outFile -Encoding UTF8
               $rc = $LASTEXITCODE
             } finally {
@@ -175,7 +197,7 @@ pipeline {
           if (Test-Path (Join-Path $env:WORKSPACE "api\\package.json")) {
             Write-Host "-- ESLint API"
             $rc = Run-And-Capture (Join-Path $env:WORKSPACE "api") "npm run lint --silent" $apiOut
-            if ($rc -ne 0) { Add-Content $apiOut "`r`nESLint API issues or lint script missing (NON-BLOCKING)." }
+            if ($rc -ne 0) { Add-Content $apiOut "`r`nESLint API issues OR lint script missing (NON-BLOCKING)." }
           } else {
             "api/package.json not found" | Out-File $apiOut -Encoding UTF8
           }
@@ -185,7 +207,7 @@ pipeline {
           if (Test-Path (Join-Path $env:WORKSPACE "frontend\\app\\package.json")) {
             Write-Host "-- ESLint Frontend"
             $rc = Run-And-Capture (Join-Path $env:WORKSPACE "frontend\\app") "npm run lint --silent" $feOut
-            if ($rc -ne 0) { Add-Content $feOut "`r`nESLint Frontend issues or lint script missing (NON-BLOCKING)." }
+            if ($rc -ne 0) { Add-Content $feOut "`r`nESLint Frontend issues OR lint script missing (NON-BLOCKING)." }
           } else {
             "frontend/app/package.json not found" | Out-File $feOut -Encoding UTF8
           }
@@ -257,7 +279,7 @@ pipeline {
     }
 
     // ==========================================================
-    // SECURITY (Trivy + NEW Dependency-Check + NEW Gitleaks)
+    // SECURITY (near Trivy): Trivy + Dependency-Check + Gitleaks
     // ==========================================================
 
     stage('Security - Trivy FS Scan (vuln+misconfig)') {
@@ -280,38 +302,52 @@ pipeline {
       }
     }
 
-    // NEW: Dependency-Check (NON-BLOCKING, Docker-based)
+    // FIXED: valid formats + PowerShell non-blocking (no cmd parser issues)
     stage('Security - Dependency-Check (SCA)') {
       steps {
-        bat """
-          @echo off
-          setlocal
-          echo ===== OWASP DEPENDENCY-CHECK (SCA) =====
+        powershell '''
+          Write-Host "===== OWASP DEPENDENCY-CHECK (SCA) ====="
+          $ErrorActionPreference = "Continue"
 
-          if not exist "%WORKSPACE%\\%REPORT_DIR%\\dependency-check" mkdir "%WORKSPACE%\\%REPORT_DIR%\\dependency-check"
+          $root = Join-Path $env:WORKSPACE $env:REPORT_DIR
+          $outDir = Join-Path $root "dependency-check"
+          New-Item -ItemType Directory -Force $outDir | Out-Null
 
-          docker run --rm ^
-            -v "%WORKSPACE%:/src" ^
-            -w /src ^
-            owasp/dependency-check:latest ^
-            --project "%APP_NAME%" ^
-            --scan /src/api/package-lock.json ^
-            --scan /src/api/package.json ^
-            --scan /src/frontend/app/package-lock.json ^
-            --scan /src/frontend/app/package.json ^
-            --format "HTML,JSON" ^
-            --out /src/%REPORT_DIR%/dependency-check ^
-            --failOnCVSS 11
+          $vol = "$($env:WORKSPACE):/src"
 
-          set DC_RC=%ERRORLEVEL%
-          if not "%DC_RC%"=="0" (
-            echo Dependency-Check returned non-zero exit (%DC_RC%). Reports generated where possible.> "%WORKSPACE%\\%REPORT_DIR%\\dependency-check\\dependency-check-note.txt"
-          ) else (
-            echo Dependency-Check completed successfully.> "%WORKSPACE%\\%REPORT_DIR%\\dependency-check\\dependency-check-note.txt"
-          )
+          $rc = 0
+          try {
+            # Use separate --format args (HTML + JSON)
+            & docker run --rm `
+              -v $vol `
+              -w /src `
+              owasp/dependency-check:latest `
+              --project $env:APP_NAME `
+              --scan /src/api/package.json `
+              --scan /src/api/package-lock.json `
+              --scan /src/frontend/app/package.json `
+              --scan /src/frontend/app/package-lock.json `
+              --format HTML `
+              --format JSON `
+              --out ("/src/" + $env:REPORT_DIR + "/dependency-check") `
+              --failOnCVSS 11
 
-          exit /b 0
-        """
+            $rc = $LASTEXITCODE
+          } catch {
+            $rc = 1
+            ("Dependency-Check execution error: " + $_.Exception.Message) | Set-Content -Path (Join-Path $outDir "dependency-check-error.txt") -Encoding UTF8
+          }
+
+          if ($rc -ne 0) {
+            ("Dependency-Check finished with non-zero exit code (" + $rc + "). Reports generated where possible.") |
+              Set-Content -Path (Join-Path $outDir "dependency-check-note.txt") -Encoding UTF8
+          } else {
+            "Dependency-Check completed successfully." |
+              Set-Content -Path (Join-Path $outDir "dependency-check-note.txt") -Encoding UTF8
+          }
+
+          exit 0
+        '''
       }
       post {
         always {
@@ -320,33 +356,48 @@ pipeline {
       }
     }
 
-    // NEW: Gitleaks (NON-BLOCKING, Docker-based)
+    // FIXED: PowerShell non-blocking
     stage('Security - Gitleaks (Secrets Scan)') {
       steps {
-        bat """
-          @echo off
-          setlocal
-          echo ===== GITLEAKS SECRETS SCAN =====
+        powershell '''
+          Write-Host "===== GITLEAKS SECRETS SCAN ====="
+          $ErrorActionPreference = "Continue"
 
-          if not exist "%WORKSPACE%\\%REPORT_DIR%\\gitleaks" mkdir "%WORKSPACE%\\%REPORT_DIR%\\gitleaks"
+          $root = Join-Path $env:WORKSPACE $env:REPORT_DIR
+          $outDir = Join-Path $root "gitleaks"
+          New-Item -ItemType Directory -Force $outDir | Out-Null
 
-          docker run --rm ^
-            -v "%WORKSPACE%:/src" ^
-            gitleaks/gitleaks:latest ^
-            detect --source=/src --report-format json --report-path /src/%REPORT_DIR%/gitleaks/gitleaks-report.json --redact
+          $vol = "$($env:WORKSPACE):/src"
+          $reportPathHost = Join-Path $outDir "gitleaks-report.json"
+          $notePathHost   = Join-Path $outDir "gitleaks-note.txt"
 
-          set GL_RC=%ERRORLEVEL%
+          $rc = 0
+          try {
+            & docker run --rm `
+              -v $vol `
+              gitleaks/gitleaks:latest `
+              detect --source=/src --report-format json --report-path ("/src/" + $env:REPORT_DIR + "/gitleaks/gitleaks-report.json") --redact
 
-          if not exist "%WORKSPACE%\\%REPORT_DIR%\\gitleaks\\gitleaks-report.json" echo []> "%WORKSPACE%\\%REPORT_DIR%\\gitleaks\\gitleaks-report.json"
+            $rc = $LASTEXITCODE
+          } catch {
+            $rc = 1
+            ("Gitleaks execution error: " + $_.Exception.Message) | Set-Content -Path (Join-Path $outDir "gitleaks-error.txt") -Encoding UTF8
+          }
 
-          if not "%GL_RC%"=="0" (
-            echo Potential secrets detected OR scan returned non-zero exit (%GL_RC%). Review gitleaks-report.json.> "%WORKSPACE%\\%REPORT_DIR%\\gitleaks\\gitleaks-note.txt"
-          ) else (
-            echo No secrets detected by Gitleaks.> "%WORKSPACE%\\%REPORT_DIR%\\gitleaks\\gitleaks-note.txt"
-          )
+          # Ensure report exists even when empty
+          if (-not (Test-Path $reportPathHost -PathType Leaf)) {
+            "[]" | Set-Content -Path $reportPathHost -Encoding UTF8
+          }
 
-          exit /b 0
-        """
+          if ($rc -ne 0) {
+            ("Potential secrets detected OR scan returned non-zero exit (" + $rc + "). Review gitleaks-report.json.") |
+              Set-Content -Path $notePathHost -Encoding UTF8
+          } else {
+            "No secrets detected by Gitleaks." | Set-Content -Path $notePathHost -Encoding UTF8
+          }
+
+          exit 0
+        '''
       }
       post {
         always {
@@ -426,6 +477,11 @@ pipeline {
 
   post {
     always {
+      bat """
+        @echo off
+        echo ===== POST: DOCKER PS =====
+        docker ps
+      """
       archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**'
     }
 
