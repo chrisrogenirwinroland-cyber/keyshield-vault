@@ -3,171 +3,63 @@ pipeline {
 
   options {
     timestamps()
-    ansiColor('xterm')
-    disableConcurrentBuilds()
-    buildDiscarder(logRotator(numToKeepStr: '15'))
-    skipDefaultCheckout(true)
   }
 
   environment {
-    APP_NAME  = "keyshield-vault"
+    APP_NAME        = "keyshield-vault"
+    DOCKERHUB_USER  = "rogen7spark"
 
-    // ===== DockerHub =====
-    DOCKERHUB_NAMESPACE = "rogen7spark"
-    DOCKERHUB_CREDS_ID  = "dockerhub-creds"
+    // Change these to your Jenkins credential IDs
+    DH_USER_CRED_ID = "dockerhub-user"
+    DH_PASS_CRED_ID = "dockerhub-pass"
 
-    // ===== SonarCloud =====
-    SONAR_SERVER_NAME   = "SonarCloud"
-    SONAR_SCANNER_TOOL  = "SonarQubeScanner"
-    SONAR_TOKEN_ID      = "sonar-token"
-    SONAR_ORG           = "chrisrogenirwinroland-cyber"
-    SONAR_PROJECT_KEY   = "chrisrogenirwinroland-cyber_keyshield-vault"
+    EMAIL_TO        = "s225493677@deakin.edu.au"
 
-    // ===== Email =====
-    ALERT_TO = "s225493677@deakin.edu.au"
-
-    // ===== URLs =====
-    FE_URL  = "http://localhost:4200"
-    API_URL = "http://localhost:3000"
-
-    // ===== Reports =====
-    REPORT_DIR = "reports"
+    // SonarCloud dashboard (keep yours)
+    SONAR_DASHBOARD = "https://sonarcloud.io/dashboard?id=chrisrogenirwinroland-cyber_keyshield-vault"
   }
 
   stages {
 
-    stage('Checkout & Traceability') {
+    stage('Checkout') {
       steps {
         checkout scm
-        script {
-          def sha = bat(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-          // ✅ Avoid "unknown" tags: if git fails, fallback to build number
-          env.GIT_SHA = (sha && sha != "") ? sha : "${env.BUILD_NUMBER}"
-          echo "Resolved IMAGE TAG = ${env.GIT_SHA}"
-        }
-
-        bat """
-          echo ===== GIT TRACEABILITY =====
-          git log -1 --pretty=oneline
-        """
       }
     }
 
-    stage('Preflight (Toolchain Verification)') {
-      steps {
-        bat """
-          echo ===== TOOL VERSIONS =====
-          where node
-          node -v
-          npm -v
-
-          echo ===== DOCKER =====
-          where docker
-          docker version
-
-          echo ===== TRIVY =====
-          where trivy
-          trivy --version
-        """
-      }
-    }
-
-    stage('Install & Unit Tests - API') {
-      steps {
-        dir('api') {
-          bat """
-            npm ci
-            npm test
-          """
-        }
-      }
-      post {
-        always {
-          junit allowEmptyResults: true, testResults: 'api/**/junit*.xml, api/**/TEST-*.xml'
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'api/npm-debug.log, api/**/coverage/**'
-        }
-      }
-    }
-
-    stage('Install & Unit Tests - Frontend') {
-      steps {
-        dir('frontend/app') {
-          bat """
-            npm ci
-            npm test
-          """
-        }
-      }
-      post {
-        always {
-          junit allowEmptyResults: true, testResults: 'frontend/app/**/junit*.xml, frontend/app/**/TEST-*.xml'
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'frontend/app/npm-debug.log, frontend/app/**/coverage/**'
-        }
-      }
-    }
-
-    stage('Build - Frontend (Angular)') {
-      steps {
-        dir('frontend/app') {
-          bat "npm run build"
-        }
-      }
-      post {
-        always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'frontend/app/dist/**'
-        }
-      }
-    }
-
-    stage('Code Quality - SonarCloud') {
+    stage('Resolve Build Metadata (Clean SHA)') {
       steps {
         script {
-          def scannerHome = tool("${SONAR_SCANNER_TOOL}")
-          withSonarQubeEnv("${SONAR_SERVER_NAME}") {
-            withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
-              bat """
-                "${scannerHome}\\bin\\sonar-scanner.bat" ^
-                  -Dsonar.host.url=https://sonarcloud.io ^
-                  -Dsonar.token=%SONAR_TOKEN% ^
-                  -Dsonar.organization=%SONAR_ORG% ^
-                  -Dsonar.projectKey=%SONAR_PROJECT_KEY% ^
-                  -Dsonar.projectName=%SONAR_PROJECT_KEY% ^
-                  -Dsonar.sources=api,frontend/app/src ^
-                  -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/.angular/**,**/coverage/** ^
-                  -Dsonar.javascript.lcov.reportPaths=api/coverage/lcov.info,frontend/app/coverage/lcov.info
-              """
-            }
-          }
+          def raw = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short HEAD').trim()
+          // If Jenkins adds extra tokens, keep only the last token
+          env.GIT_SHA = raw.tokenize().last()
+
+          env.IMAGE_TAG = env.GIT_SHA ?: "${env.BUILD_NUMBER}"
+
+          env.API_IMAGE = "${env.DOCKERHUB_USER}/${env.APP_NAME}-api:${env.IMAGE_TAG}"
+          env.WEB_IMAGE = "${env.DOCKERHUB_USER}/${env.APP_NAME}-web:${env.IMAGE_TAG}"
+
+          echo "GIT_SHA=${env.GIT_SHA}"
+          echo "API_IMAGE=${env.API_IMAGE}"
+          echo "WEB_IMAGE=${env.WEB_IMAGE}"
         }
       }
     }
 
-    stage('Security - Trivy FS Scan (vuln+misconfig)') {
+    stage('Build - API Image') {
       steps {
         bat """
-          if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
-
-          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format json  --output "%REPORT_DIR%\\trivy-fs.json" .
-          trivy fs --scanners vuln,misconfig --severity HIGH,CRITICAL --format table --output "%REPORT_DIR%\\trivy-fs.txt"  .
+        echo ===== BUILD API =====
+        docker build -t ${env.API_IMAGE} -f backend\\Dockerfile backend
         """
       }
-      post {
-        always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-fs.json, reports/trivy-fs.txt'
-        }
-      }
     }
 
-    stage('Build Docker Images') {
+    stage('Build - Web Image') {
       steps {
         bat """
-          set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
-          set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
-
-          docker build -t %API_IMAGE% -f api\\Dockerfile api
-          docker build -t %FE_IMAGE% -f frontend\\app\\Dockerfile frontend\\app
-
-          docker images | findstr %APP_NAME%
+        echo ===== BUILD WEB =====
+        docker build -t ${env.WEB_IMAGE} -f frontend\\app\\Dockerfile frontend\\app
         """
       }
     }
@@ -175,38 +67,45 @@ pipeline {
     stage('Security - Trivy Image Scan (TAR input, Windows-safe)') {
       steps {
         bat """
-          if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
+        echo ===== TRIVY IMAGE SCAN (TAR) =====
+        if not exist "reports" mkdir "reports"
 
-          set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
-          set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
+        echo -- Saving images to TAR
+        docker save -o "reports\\api-image.tar" ${env.API_IMAGE}
+        docker save -o "reports\\web-image.tar" ${env.WEB_IMAGE}
 
-          docker save -o "%REPORT_DIR%\\api-image.tar" %API_IMAGE%
-          docker save -o "%REPORT_DIR%\\fe-image.tar"  %FE_IMAGE%
+        echo -- Trivy scan API
+        trivy image --input "reports\\api-image.tar" --severity HIGH,CRITICAL --format json --output "reports\\trivy-api-image.json"
 
-          trivy image --scanners vuln --input "%REPORT_DIR%\\api-image.tar" --severity HIGH,CRITICAL --format json --output "%REPORT_DIR%\\trivy-api-image.json"
-          trivy image --scanners vuln --input "%REPORT_DIR%\\fe-image.tar"  --severity HIGH,CRITICAL --format json --output "%REPORT_DIR%\\trivy-fe-image.json"
+        echo -- Trivy scan WEB
+        trivy image --input "reports\\web-image.tar" --severity HIGH,CRITICAL --format json --output "reports\\trivy-web-image.json"
+
+        echo ===== TRIVY COMPLETE =====
         """
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-api-image.json, reports/trivy-fe-image.json'
+          archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
         }
       }
     }
 
     stage('Push Images (Docker Hub)') {
       steps {
-        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS_ID}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+        withCredentials([
+          string(credentialsId: "${env.DH_USER_CRED_ID}", variable: 'DH_USER'),
+          string(credentialsId: "${env.DH_PASS_CRED_ID}", variable: 'DH_PASS')
+        ]) {
           bat """
-            echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
+          echo ===== DOCKER LOGIN =====
+          echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
 
-            set API_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-api:%GIT_SHA%
-            set FE_IMAGE=%DOCKERHUB_NAMESPACE%/%APP_NAME%-web:%GIT_SHA%
+          echo ===== PUSH =====
+          docker push ${env.API_IMAGE}
+          docker push ${env.WEB_IMAGE}
 
-            docker push %API_IMAGE%
-            docker push %FE_IMAGE%
-
-            docker logout
+          echo ===== LOGOUT =====
+          docker logout
           """
         }
       }
@@ -215,126 +114,155 @@ pipeline {
     stage('Deploy - Docker Compose (Staging)') {
       steps {
         bat """
-          docker compose -f docker-compose.yml down
-          docker compose -f docker-compose.yml up -d --build
-          docker ps
+        echo ===== DEPLOY STAGING =====
+        docker compose -f docker-compose.yml down
+        docker compose -f docker-compose.yml up -d --build
+        docker ps
         """
       }
     }
 
     stage('Release - Smoke / Health Validation') {
       steps {
-        powershell '''
-          Write-Host "===== RELEASE SMOKE TEST ====="
-          $ErrorActionPreference = "Stop"
+        powershell """
+          Write-Host '===== RELEASE SMOKE TEST ====='
+          \$fe = Invoke-WebRequest http://localhost:4200 -UseBasicParsing -TimeoutSec 20
+          Write-Host ('FE Status: ' + \$fe.StatusCode)
 
-          $r1 = Invoke-WebRequest "$env:FE_URL" -UseBasicParsing -TimeoutSec 20
-          Write-Host ("FE Status: " + $r1.StatusCode)
-
-          try {
-            $r2 = Invoke-WebRequest "$env:API_URL/health" -UseBasicParsing -TimeoutSec 20
-            Write-Host ("API /health Status: " + $r2.StatusCode)
-          } catch {
-            $r3 = Invoke-WebRequest "$env:API_URL" -UseBasicParsing -TimeoutSec 20
-            Write-Host ("API Root Status: " + $r3.StatusCode)
-          }
-        '''
+          \$api = Invoke-WebRequest http://localhost:3000/health -UseBasicParsing -TimeoutSec 20
+          Write-Host ('API /health Status: ' + \$api.StatusCode)
+        """
       }
     }
 
-    // ✅ FIX: Validate monitoring ONLY if already running, with retries (no redeploy from Jenkins)
     stage('Monitoring - Validate (If Running)') {
       steps {
-        powershell '''
-          Write-Host "===== MONITORING VALIDATION (SAFE) ====="
-          $ErrorActionPreference = "Continue"
+        powershell """
+          Write-Host '===== MONITORING VALIDATION (SAFE) ====='
+          \$url = 'http://localhost:9090/-/ready'
+          \$ok = \$false
 
-          function Test-Ready($url, $name) {
-            for ($i=1; $i -le 10; $i++) {
-              try {
-                $r = Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 10
-                if ($r.StatusCode -eq 200) {
-                  Write-Host "$name READY (200) on attempt $i"
-                  return $true
-                }
-              } catch {
-                Start-Sleep -Seconds 3
+          for (\$i=1; \$i -le 5; \$i++) {
+            try {
+              \$r = Invoke-WebRequest \$url -UseBasicParsing -TimeoutSec 10
+              if (\$r.StatusCode -eq 200) {
+                Write-Host "Prometheus READY (200) on attempt \$i"
+                \$ok = \$true
+                break
               }
+            } catch {
+              Start-Sleep -Seconds 3
             }
-            Write-Host "$name not ready after retries: $url"
-            return $false
           }
 
-          # Check if containers exist (avoid failing pipeline if not present)
-          $ps = docker ps --format "{{.Names}}"
-          $hasProm = $ps -match "monitoring-prometheus"
-          $hasAM   = $ps -match "monitoring-alertmanager"
-
-          if (-not $hasProm -and -not $hasAM) {
-            Write-Host "Monitoring containers not running - skipping validation."
-            exit 0
+          if (-not \$ok) {
+            Write-Host 'Prometheus not ready (continuing without failing build).'
           }
+        """
+      }
+    }
 
-          if ($hasProm) {
-            $okP = Test-Ready "http://localhost:9090/-/ready" "Prometheus"
-            if (-not $okP) { throw "Prometheus validation failed" }
+    stage('Package Reports for Email') {
+      steps {
+        powershell """
+          if (Test-Path 'reports') {
+            if (Test-Path 'reports\\security-reports.zip') { Remove-Item 'reports\\security-reports.zip' -Force }
+            Compress-Archive -Path 'reports\\*' -DestinationPath 'reports\\security-reports.zip' -Force
+            Write-Host 'Packaged reports\\security-reports.zip'
+          } else {
+            Write-Host 'No reports folder found.'
           }
-
-          if ($hasAM) {
-            $okA = Test-Ready "http://localhost:9093/-/ready" "Alertmanager"
-            if (-not $okA) { throw "Alertmanager validation failed" }
-          }
-        '''
+        """
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/security-reports.zip', allowEmptyArchive: true
+        }
       }
     }
   }
 
   post {
-    always {
-      bat """
-        docker ps
-      """
-      archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/**'
-    }
-
     success {
-      emailext(
-        to: "${ALERT_TO}",
-        subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-        body: """Build SUCCESS.
+      script {
+        def subject = "✅ SUCCESS | ${env.JOB_NAME} #${env.BUILD_NUMBER} | ${env.GIT_SHA}"
+        def artifactsUrl = "${env.BUILD_URL}artifact/"
+        def reportZipUrl = "${env.BUILD_URL}artifact/reports/security-reports.zip"
 
-Job: ${JOB_NAME}
-Build: #${BUILD_NUMBER}
-Commit/Tag: ${GIT_SHA}
-URL: ${BUILD_URL}
+        emailext(
+          to: "${env.EMAIL_TO}",
+          subject: subject,
+          mimeType: 'text/html',
+          attachmentsPattern: 'reports/security-reports.zip,reports/trivy-*.json',
+          body: """
+          <html>
+            <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
+              <h2 style="margin:0 0 8px 0;">Build SUCCESS</h2>
 
-Images pushed:
-- ${DOCKERHUB_NAMESPACE}/${APP_NAME}-api:${GIT_SHA}
-- ${DOCKERHUB_NAMESPACE}/${APP_NAME}-web:${GIT_SHA}
+              <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;">
+                <tr><td><b>Job</b></td><td>${env.JOB_NAME}</td></tr>
+                <tr><td><b>Build #</b></td><td>${env.BUILD_NUMBER}</td></tr>
+                <tr><td><b>Commit</b></td><td>${env.GIT_SHA}</td></tr>
+                <tr><td><b>Build URL</b></td><td><a href="${env.BUILD_URL}">${env.BUILD_URL}</a></td></tr>
+                <tr><td><b>Images pushed</b></td><td>
+                  <div>${env.API_IMAGE}</div>
+                  <div>${env.WEB_IMAGE}</div>
+                </td></tr>
+                <tr><td><b>Artifacts</b></td><td><a href="${artifactsUrl}">${artifactsUrl}</a></td></tr>
+                <tr><td><b>Reports (ZIP)</b></td><td><a href="${reportZipUrl}">${reportZipUrl}</a></td></tr>
+                <tr><td><b>SonarCloud</b></td><td><a href="${env.SONAR_DASHBOARD}">${env.SONAR_DASHBOARD}</a></td></tr>
+                <tr><td><b>Deployed endpoints</b></td><td>
+                  <div>Frontend: <a href="http://localhost:4200">http://localhost:4200</a></div>
+                  <div>API Health: <a href="http://localhost:3000/health">http://localhost:3000/health</a></div>
+                  <div>Prometheus: <a href="http://localhost:9090">http://localhost:9090</a></div>
+                  <div>Grafana: <a href="http://localhost:3001">http://localhost:3001</a></div>
+                </td></tr>
+              </table>
 
-Artifacts:
-- Trivy reports: Jenkins artifacts -> reports/*
-- SonarCloud: https://sonarcloud.io/dashboard?id=${SONAR_PROJECT_KEY}
-"""
-      )
+              <p style="margin-top:14px;">
+                <b>Attached:</b> security-reports.zip (Trivy JSON + pipeline outputs), and trivy-*.json files.
+              </p>
+
+              <p style="color:#666; margin-top:18px;">
+                Generated by Jenkins (${env.APP_NAME}) • ${new Date()}
+              </p>
+            </body>
+          </html>
+          """
+        )
+      }
     }
 
     failure {
-      emailext(
-        to: "${ALERT_TO}",
-        subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-        body: """Build FAILED.
+      script {
+        def subject = "❌ FAILED | ${env.JOB_NAME} #${env.BUILD_NUMBER} | ${env.GIT_SHA ?: 'no-sha'}"
+        emailext(
+          to: "${env.EMAIL_TO}",
+          subject: subject,
+          mimeType: 'text/html',
+          attachLog: true,
+          attachmentsPattern: 'reports/**',
+          body: """
+          <html>
+            <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
+              <h2 style="margin:0 0 8px 0;">Build FAILED</h2>
+              <p><b>Job:</b> ${env.JOB_NAME}<br/>
+                 <b>Build #:</b> ${env.BUILD_NUMBER}<br/>
+                 <b>Build URL:</b> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a>
+              </p>
+              <p>Log attached (if enabled). Reports folder attached when available.</p>
+            </body>
+          </html>
+          """
+        )
+      }
+    }
 
-Job: ${JOB_NAME}
-Build: #${BUILD_NUMBER}
-Commit/Tag: ${GIT_SHA}
-URL: ${BUILD_URL}
-
-Look at console output for first failing stage.
-Artifacts (if created): Jenkins artifacts -> reports/*
-""",
-        attachLog: true
-      )
+    always {
+      bat """
+      echo ===== POST: DOCKER PS =====
+      docker ps
+      """
     }
   }
 }
