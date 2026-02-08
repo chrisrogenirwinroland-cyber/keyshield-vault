@@ -1,6 +1,6 @@
 // Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, Docker, Email alerts)
 // Added:
-//   - Code Quality: ESLint + Prettier (non-blocking reports)
+//   - Code Quality: ESLint + Prettier (non-blocking reports)  ✅ FIXED: PowerShell to avoid CMD parse errors
 //   - Security: OWASP Dependency-Check (SCA) + Gitleaks (secrets scan) (non-blocking reports)
 //
 // Repo layout:
@@ -77,9 +77,15 @@ pipeline {
           git status
         """
         script {
-          // More reliable on Windows Jenkins than powershell() in some setups:
-          def raw = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short HEAD').trim()
-          env.GIT_SHA = raw?.tokenize()?.last()
+          // ✅ FIXED: real newline script (Groovy-safe)
+          def raw = bat(
+            returnStdout: true,
+            script: """@echo off
+git rev-parse --short HEAD
+"""
+          ).trim()
+
+          env.GIT_SHA = raw?.readLines()?.last()?.trim()
           if (!env.GIT_SHA) { env.GIT_SHA = "manual" }
           echo "Resolved GIT_SHA = ${env.GIT_SHA}"
         }
@@ -154,63 +160,55 @@ pipeline {
     }
 
     // ----------------------------
-    // CODE QUALITY (ADDED)
+    // CODE QUALITY (ADDED) ✅ FIXED
     // ----------------------------
 
     stage('Code Quality - ESLint (API + Frontend)') {
       steps {
-        bat """
-          @echo off
-          setlocal enabledelayedexpansion
-          echo ===== ESLINT CODE QUALITY =====
+        // ✅ FIXED: PowerShell avoids CMD parse errors and file-lock weirdness
+        powershell '''
+          Write-Host "===== ESLINT CODE QUALITY ====="
 
-          if not exist "%WORKSPACE%\\%REPORT_DIR%\\eslint" mkdir "%WORKSPACE%\\%REPORT_DIR%\\eslint"
+          $base   = Join-Path $env:WORKSPACE $env:REPORT_DIR
+          $outDir = Join-Path $base "eslint"
+          New-Item -ItemType Directory -Force $outDir | Out-Null
 
-          set OUT_API=%WORKSPACE%\\%REPORT_DIR%\\eslint\\eslint-api.txt
-          set TMP_API=%WORKSPACE%\\%REPORT_DIR%\\eslint\\eslint-api.%BUILD_NUMBER%.tmp
-          set OUT_FE=%WORKSPACE%\\%REPORT_DIR%\\eslint\\eslint-fe.txt
-          set TMP_FE=%WORKSPACE%\\%REPORT_DIR%\\eslint\\eslint-fe.%BUILD_NUMBER%.tmp
+          function Run-Lint([string]$relPath, [string]$outFile, [string]$label) {
+            $fullPath = Join-Path $env:WORKSPACE $relPath
+            $pkg = Join-Path $fullPath "package.json"
 
-          echo -- API ESLint
-          pushd api
-          if exist package.json (
-            call npm run lint --silent > "!TMP_API!" 2>&1
-            set RC=!ERRORLEVEL!
-            if not "!RC!"=="0" (
-              echo.>> "!TMP_API!"
-              echo ESLint API issues detected (non-blocking). See output above.>> "!TMP_API!"
-            ) else (
-              echo.>> "!TMP_API!"
-              echo ESLint API: no issues detected.>> "!TMP_API!"
-            )
-          ) else (
-            echo api/package.json not found> "!TMP_API!"
-          )
-          popd
+            if (-not (Test-Path $pkg -PathType Leaf)) {
+              "package.json not found at $relPath" | Set-Content -Path $outFile -Encoding UTF8
+              return
+            }
 
-          echo -- Frontend ESLint
-          pushd frontend\\app
-          if exist package.json (
-            call npm run lint --silent > "!TMP_FE!" 2>&1
-            set RC=!ERRORLEVEL!
-            if not "!RC!"=="0" (
-              echo.>> "!TMP_FE!"
-              echo ESLint Frontend issues detected (non-blocking). See output above.>> "!TMP_FE!"
-            ) else (
-              echo.>> "!TMP_FE!"
-              echo ESLint Frontend: no issues detected.>> "!TMP_FE!"
-            )
-          ) else (
-            echo frontend/app/package.json not found> "!TMP_FE!"
-          )
-          popd
+            Push-Location $fullPath
+            try {
+              $output = & cmd /c "npm run lint --silent" 2>&1
+              $rc = $LASTEXITCODE
 
-          copy /y "!TMP_API!" "!OUT_API!" >nul 2>&1
-          copy /y "!TMP_FE!"  "!OUT_FE!"  >nul 2>&1
+              $output | Out-File -FilePath $outFile -Encoding UTF8
+              Add-Content -Path $outFile -Value ""
 
-          echo ===== ESLINT COMPLETE =====
-          exit /b 0
-        """
+              if ($rc -ne 0) {
+                Add-Content -Path $outFile -Value "$label ESLint issues detected (non-blocking)."
+              } else {
+                Add-Content -Path $outFile -Value "$label ESLint: no issues detected."
+              }
+            } catch {
+              $_ | Out-File -FilePath $outFile -Encoding UTF8
+              Add-Content -Path $outFile -Value "$label ESLint failed to run (non-blocking)."
+            } finally {
+              Pop-Location
+            }
+          }
+
+          Run-Lint "api"           (Join-Path $outDir "eslint-api.txt") "API"
+          Run-Lint "frontend\\app" (Join-Path $outDir "eslint-fe.txt")  "Frontend"
+
+          Write-Host "===== ESLINT COMPLETE ====="
+          exit 0
+        '''
       }
       post {
         always {
@@ -221,32 +219,39 @@ pipeline {
 
     stage('Code Quality - Prettier (Format Check)') {
       steps {
-        bat """
-          @echo off
-          setlocal enabledelayedexpansion
-          echo ===== PRETTIER FORMAT CHECK =====
+        // ✅ FIXED: PowerShell captures Prettier exit code but never fails pipeline
+        powershell '''
+          Write-Host "===== PRETTIER FORMAT CHECK ====="
 
-          if not exist "%WORKSPACE%\\%REPORT_DIR%\\prettier" mkdir "%WORKSPACE%\\%REPORT_DIR%\\prettier"
+          $base   = Join-Path $env:WORKSPACE $env:REPORT_DIR
+          $outDir = Join-Path $base "prettier"
+          New-Item -ItemType Directory -Force $outDir | Out-Null
 
-          set OUT=%WORKSPACE%\\%REPORT_DIR%\\prettier\\prettier-check.txt
-          set TMP=%WORKSPACE%\\%REPORT_DIR%\\prettier\\prettier-check.%BUILD_NUMBER%.tmp
+          $outFile = Join-Path $outDir "prettier-check.txt"
 
-          rem Uses npx so it runs even if prettier is devDependency; if not installed it will attempt download.
-          npx --yes prettier -c . > "!TMP!" 2>&1
-          set RC=!ERRORLEVEL!
+          Push-Location $env:WORKSPACE
+          try {
+            $output = & cmd /c "npx --yes prettier -c ." 2>&1
+            $rc = $LASTEXITCODE
 
-          if not "!RC!"=="0" (
-            echo.>> "!TMP!"
-            echo Prettier found formatting differences OR Prettier is not configured. (non-blocking)>> "!TMP!"
-          ) else (
-            echo.>> "!TMP!"
-            echo Prettier: formatting OK.>> "!TMP!"
-          )
+            $output | Out-File -FilePath $outFile -Encoding UTF8
+            Add-Content -Path $outFile -Value ""
 
-          copy /y "!TMP!" "!OUT!" >nul 2>&1
-          echo ===== PRETTIER COMPLETE =====
-          exit /b 0
-        """
+            if ($rc -ne 0) {
+              Add-Content -Path $outFile -Value "Prettier found formatting differences OR Prettier is not configured. (non-blocking)"
+            } else {
+              Add-Content -Path $outFile -Value "Prettier: formatting OK."
+            }
+          } catch {
+            $_ | Out-File -FilePath $outFile -Encoding UTF8
+            Add-Content -Path $outFile -Value "Prettier failed to run (non-blocking)."
+          } finally {
+            Pop-Location
+          }
+
+          Write-Host "===== PRETTIER COMPLETE ====="
+          exit 0
+        '''
       }
       post {
         always {
@@ -506,7 +511,7 @@ pipeline {
                   if ($d.vulnerabilities) {
                     foreach ($v in $d.vulnerabilities) {
                       $dcCount++
-                      $sev = ($v.severity | ForEach-Object { "$_".ToUpperInvariant() })
+                      $sev = ("$($v.severity)").ToUpperInvariant()
                       if ($sev -eq "HIGH") { $dcHigh++ }
                       if ($sev -eq "CRITICAL") { $dcCritical++ }
                     }
