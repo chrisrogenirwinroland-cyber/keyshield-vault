@@ -1,11 +1,22 @@
-// Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, OWASP Dependency-Check, Docker, HTML Email alerts)
+// Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, Docker, Email alerts)
 //
-// Updates included (per your request):
-// 1) Email template upgraded (UTF-8 + HTML) and REMOVED emojis/special chars that were causing "âœ…" encoding artifacts.
-// 2) Adds SonarCloud Quality Gate + key metrics summary into reports + email (via SonarCloud API using sonar-token).
-// 3) Adds Dependency-Check JSON summary into reports + email (severity counts, top findings if present).
-// 4) Adds Trivy "Top Findings" extract (top HIGH/CRITICAL) into reports + email.
-// 5) Keeps your stages/flow intact; remains Windows-safe (bat + powershell).
+// Repo layout:
+//  - api/package.json, api/package-lock.json, api/Dockerfile
+//  - frontend/app/package.json, frontend/app/package-lock.json, frontend/app/Dockerfile
+//  - docker-compose.yml at repo root
+//
+// Jenkins requirements:
+//  - SonarQube Scanner tool in Jenkins: "SonarQubeScanner"
+//  - SonarCloud server in Jenkins: "SonarCloud"
+//  - Credentials:
+//      * sonar-token (Secret text)         -> SonarCloud token
+//      * dockerhub-creds (Username/Pass)   -> DockerHub
+//      * nvd-api-key (Secret text)         -> NVD API key for Dependency-Check
+//  - Email Extension Plugin configured (SMTP)
+//
+// IMPORTANT: Trivy must be on Jenkins service PATH.
+// If "trivy not recognized", restart Jenkins service OR add to Jenkins global env PATH:
+//   C:\ProgramData\chocolatey\bin
 
 pipeline {
   agent any
@@ -22,7 +33,6 @@ pipeline {
     // ========= App / traceability =========
     APP_NAME  = "keyshield-vault"
     GIT_SHA   = "unknown"
-    GIT_BRANCH = "unknown"
 
     // ========= Docker Hub =========
     DOCKERHUB_NAMESPACE = "rogen7spark"
@@ -35,11 +45,8 @@ pipeline {
     SONAR_ORG           = "chrisrogenirwinroland-cyber"
     SONAR_PROJECT_KEY   = "chrisrogenirwinroland-cyber_keyshield-vault"
 
-    // ========= Dependency-Check (NVD) =========
+    // ========= Dependency-Check =========
     NVD_API_KEY_CRED_ID = "nvd-api-key"
-
-    // ========= SAST/SCA helper images =========
-    GITLEAKS_IMAGE = "zricethezav/gitleaks:latest"
 
     // ========= Email =========
     ALERT_TO = "s225493677@deakin.edu.au"
@@ -55,12 +62,6 @@ pipeline {
 
     // ========= Reports =========
     REPORT_DIR = "reports"
-
-    // ========= Email summary vars (populated at runtime) =========
-    SONAR_QG_STATUS = "UNKNOWN"
-    SONAR_METRICS_LINE = "n/a"
-    DC_SUMMARY_LINE = "n/a"
-    TRIVY_TOTALS_LINE = "n/a"
   }
 
   stages {
@@ -68,14 +69,15 @@ pipeline {
     stage('Checkout & Traceability') {
       steps {
         checkout scm
+
         script {
-          env.GIT_SHA = powershell(returnStdout: true, script: '(git rev-parse --short HEAD).Trim()').trim()
-          env.GIT_BRANCH = powershell(returnStdout: true, script: '(git rev-parse --abbrev-ref HEAD).Trim()').trim()
-          if (!env.GIT_SHA) { env.GIT_SHA = "manual" }
-          if (!env.GIT_BRANCH) { env.GIT_BRANCH = "unknown" }
+          // Robust short SHA resolution on Windows
+          def shaOut = bat(returnStdout: true, script: '@echo off\r\ngit rev-parse --short HEAD\r\n').trim()
+          def lines  = shaOut.readLines().collect { it.trim() }.findAll { it }
+          env.GIT_SHA = (lines ? lines[-1] : "manual")
           echo "Resolved GIT_SHA = ${env.GIT_SHA}"
-          echo "Resolved GIT_BRANCH = ${env.GIT_BRANCH}"
         }
+
         bat """
           echo ===== GIT TRACEABILITY =====
           git --version
@@ -102,7 +104,9 @@ pipeline {
           where trivy
           trivy --version
         """
+
         bat 'powershell -NoProfile -Command "$PSVersionTable.PSVersion"'
+
         bat """
           if not exist "%REPORT_DIR%" mkdir "%REPORT_DIR%"
           echo Preflight complete > "%REPORT_DIR%\\preflight.txt"
@@ -175,13 +179,13 @@ pipeline {
 
           Write-Host "-- ESLint API"
           $apiOut = Join-Path $eslintDir "eslint-api.txt"
-          $rc1 = Run-And-Capture (Join-Path $env:WORKSPACE "api") "npm run lint --silent" $apiOut
-          if ($rc1 -ne 0) { Add-Content $apiOut "`r`nESLint API issues OR lint script missing (NON-BLOCKING)." }
+          $rc = Run-And-Capture (Join-Path $env:WORKSPACE "api") "npm run lint --silent" $apiOut
+          if ($rc -ne 0) { Add-Content $apiOut "`r`nESLint API issues OR lint script missing (NON-BLOCKING)." }
 
           Write-Host "-- ESLint Frontend"
           $feOut = Join-Path $eslintDir "eslint-fe.txt"
-          $rc2 = Run-And-Capture (Join-Path $env:WORKSPACE "frontend\\app") "npm run lint --silent" $feOut
-          if ($rc2 -ne 0) { Add-Content $feOut "`r`nESLint Frontend issues OR lint script missing (NON-BLOCKING)." }
+          $rc = Run-And-Capture (Join-Path $env:WORKSPACE "frontend\\app") "npm run lint --silent" $feOut
+          if ($rc -ne 0) { Add-Content $feOut "`r`nESLint Frontend issues OR lint script missing (NON-BLOCKING)." }
 
           Write-Host "-- Prettier check (repo)"
           $preOut = Join-Path $prettierDir "prettier-check.txt"
@@ -192,31 +196,13 @@ pipeline {
             Add-Content $preOut "`r`nPrettier: formatting OK."
           }
 
-          # Create a small roll-up summary for email
-          $sum = Join-Path $root "lint-summary.txt"
-          $apiErr = (Select-String -Path $apiOut -Pattern "error" -SimpleMatch -ErrorAction SilentlyContinue).Count
-          $feErr  = (Select-String -Path $feOut  -Pattern "error" -SimpleMatch -ErrorAction SilentlyContinue).Count
-          $preBad = (Select-String -Path $preOut -Pattern "Prettier differences" -SimpleMatch -ErrorAction SilentlyContinue).Count
-
-          @"
-Lint Summary
-============
-API ESLint 'error' matches: $apiErr
-FE  ESLint 'error' matches: $feErr
-Prettier issues detected:   $preBad
-
-Notes:
-- Lint stages are NON-BLOCKING by design.
-- See reports/eslint and reports/prettier for full outputs.
-"@ | Set-Content -Path $sum -Encoding UTF8
-
           Write-Host "===== CODE QUALITY COMPLETE ====="
           exit 0
         '''
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/eslint/**, reports/prettier/**, reports/lint-summary.txt'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/eslint/**, reports/prettier/**'
         }
       }
     }
@@ -245,6 +231,9 @@ Notes:
             withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
               bat """
                 echo ===== SONARCLOUD SCAN (MONOREPO) =====
+                echo ProjectKey: %SONAR_PROJECT_KEY%
+                echo Org: %SONAR_ORG%
+
                 "${scannerHome}\\bin\\sonar-scanner.bat" ^
                   -Dsonar.host.url=https://sonarcloud.io ^
                   -Dsonar.token=%SONAR_TOKEN% ^
@@ -257,71 +246,6 @@ Notes:
               """
             }
           }
-        }
-      }
-      post {
-        always {
-          // Pull Quality Gate + key metrics via SonarCloud API (non-blocking)
-          script {
-            withCredentials([string(credentialsId: "${SONAR_TOKEN_ID}", variable: 'SONAR_TOKEN')]) {
-              powershell '''
-                $ErrorActionPreference = "SilentlyContinue"
-                if (-not (Test-Path $env:REPORT_DIR)) { New-Item -ItemType Directory -Force $env:REPORT_DIR | Out-Null }
-
-                function New-BasicAuth([string]$token) {
-                  $pair = "$token:"
-                  $bytes = [Text.Encoding]::ASCII.GetBytes($pair)
-                  return [Convert]::ToBase64String($bytes)
-                }
-
-                $b64 = New-BasicAuth $env:SONAR_TOKEN
-                $headers = @{ Authorization = "Basic $b64" }
-
-                $qgUrl = "https://sonarcloud.io/api/qualitygates/project_status?projectKey=$($env:SONAR_PROJECT_KEY)"
-                $mUrl  = "https://sonarcloud.io/api/measures/component?component=$($env:SONAR_PROJECT_KEY)&metricKeys=bugs,vulnerabilities,code_smells,security_hotspots,coverage,duplicated_lines_density"
-
-                $qg = Invoke-RestMethod -Uri $qgUrl -Headers $headers -Method Get
-                $qgStatus = $qg.projectStatus.status
-                if (-not $qgStatus) { $qgStatus = "UNKNOWN" }
-
-                $meas = Invoke-RestMethod -Uri $mUrl -Headers $headers -Method Get
-                $pairs = @{}
-                if ($meas.component.measures) {
-                  foreach ($m in $meas.component.measures) { $pairs[$m.metric] = $m.value }
-                }
-
-                $bugs = $pairs["bugs"]; if (-not $bugs) { $bugs="n/a" }
-                $vuln = $pairs["vulnerabilities"]; if (-not $vuln) { $vuln="n/a" }
-                $smel = $pairs["code_smells"]; if (-not $smel) { $smel="n/a" }
-                $hot  = $pairs["security_hotspots"]; if (-not $hot) { $hot="n/a" }
-                $cov  = $pairs["coverage"]; if (-not $cov) { $cov="n/a" }
-                $dup  = $pairs["duplicated_lines_density"]; if (-not $dup) { $dup="n/a" }
-
-                @"
-SonarCloud Summary
-==================
-Project: $env:SONAR_PROJECT_KEY
-Quality Gate: $qgStatus
-
-Key Metrics:
-- Bugs:              $bugs
-- Vulnerabilities:   $vuln
-- Code Smells:       $smel
-- Security Hotspots: $hot
-- Coverage (%):      $cov
-- Duplication (%):   $dup
-
-Dashboard:
-https://sonarcloud.io/dashboard?id=$env:SONAR_PROJECT_KEY
-"@ | Set-Content -Path (Join-Path $env:REPORT_DIR "sonar-summary.txt") -Encoding UTF8
-
-                # also emit a single-line version for email header
-                "QG=$qgStatus | Bugs=$bugs | Vuln=$vuln | Smells=$smel | Hotspots=$hot | Cov=$cov | Dup=$dup" |
-                  Set-Content -Path (Join-Path $env:REPORT_DIR "sonar-summary-line.txt") -Encoding UTF8
-              '''
-            }
-          }
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/sonar-summary.txt, reports/sonar-summary-line.txt'
         }
       }
     }
@@ -356,12 +280,14 @@ https://sonarcloud.io/dashboard?id=$env:SONAR_PROJECT_KEY
             $outDir = Join-Path $root "dependency-check"
             New-Item -ItemType Directory -Force $outDir | Out-Null
 
+            # Persistent cache under Jenkins Home to reduce updates
             $jenkinsHome = $env:JENKINS_HOME
             if (-not $jenkinsHome) { $jenkinsHome = "C:\\ProgramData\\Jenkins\\.jenkins" }
 
             $dcData = Join-Path $jenkinsHome "dependency-check-data"
             New-Item -ItemType Directory -Force $dcData | Out-Null
 
+            # IMPORTANT: use $() so PowerShell doesn't treat "$dcData:" as drive scope
             $srcMount  = "$($env:WORKSPACE):/src"
             $dataMount = "$($dcData):/usr/share/dependency-check/data"
 
@@ -392,8 +318,11 @@ https://sonarcloud.io/dashboard?id=$env:SONAR_PROJECT_KEY
 
             $rc = Run-DC
             if ($rc -ne 0) {
-              Write-Host "Dependency-Check failed (rc=$rc). Retrying with --noupdate (use cached DB)..."
-              $null = Run-DC -NoUpdate
+              Write-Host "Dependency-Check failed (rc=$rc). Retrying with --noupdate (cached DB)..."
+              $rc2 = Run-DC -NoUpdate
+              Write-Host "Retry rc=$rc2 (pipeline continues)."
+            } else {
+              Write-Host "Dependency-Check completed."
             }
 
             "Dependency-Check finished (non-blocking). See reports/dependency-check/." |
@@ -405,52 +334,7 @@ https://sonarcloud.io/dashboard?id=$env:SONAR_PROJECT_KEY
       }
       post {
         always {
-          // Create a small JSON-based summary for email (non-blocking)
-          powershell '''
-            $ErrorActionPreference = "SilentlyContinue"
-            $root = Join-Path $env:WORKSPACE $env:REPORT_DIR
-            $dcDir = Join-Path $root "dependency-check"
-            if (-not (Test-Path $dcDir)) { exit 0 }
-
-            $jsonPath = Join-Path $dcDir "dependency-check-report.json"
-            if (-not (Test-Path $jsonPath -PathType Leaf)) {
-              # fallback: pick any json in folder
-              $jsonAny = Get-ChildItem -Path $dcDir -Filter "*.json" | Select-Object -First 1
-              if ($jsonAny) { $jsonPath = $jsonAny.FullName }
-            }
-            if (-not (Test-Path $jsonPath -PathType Leaf)) {
-              "Dependency-Check summary: report JSON not found." | Set-Content -Path (Join-Path $root "dc-summary.txt") -Encoding UTF8
-              exit 0
-            }
-
-            $j = Get-Content $jsonPath -Raw | ConvertFrom-Json
-            $sev = [ordered]@{ CRITICAL=0; HIGH=0; MEDIUM=0; LOW=0; UNKNOWN=0 }
-
-            foreach ($d in ($j.dependencies | Where-Object { $_.vulnerabilities })) {
-              foreach ($v in $d.vulnerabilities) {
-                $s = ($v.severity | ForEach-Object { "$_".ToUpper() })
-                if (-not $s) { $s = "UNKNOWN" }
-                if ($sev.Contains($s)) { $sev[$s]++ } else { $sev["UNKNOWN"]++ }
-              }
-            }
-
-            $total = ($sev.Values | Measure-Object -Sum).Sum
-            $line = "DC Total=$total | CRIT=$($sev.CRITICAL) HIGH=$($sev.HIGH) MED=$($sev.MEDIUM) LOW=$($sev.LOW) UNK=$($sev.UNKNOWN)"
-
-            @"
-Dependency-Check Summary
-========================
-Report: $jsonPath
-$line
-
-Notes:
-- Stage is NON-BLOCKING by design.
-- Review reports/dependency-check/*.html for full detail.
-"@ | Set-Content -Path (Join-Path $root "dc-summary.txt") -Encoding UTF8
-
-            $line | Set-Content -Path (Join-Path $root "dc-summary-line.txt") -Encoding UTF8
-          '''
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/dependency-check/**, reports/dc-summary.txt, reports/dc-summary-line.txt'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/dependency-check/**'
         }
       }
     }
@@ -499,7 +383,7 @@ Notes:
       }
     }
 
-    stage('Security - Vulnerability Summary + Top Findings') {
+    stage('Security - Vulnerability Summary (includes 0 findings)') {
       steps {
         powershell '''
           Write-Host "===== VULNERABILITY SUMMARY ====="
@@ -508,7 +392,13 @@ Notes:
           function Count-Trivy($path) {
             $out = [ordered]@{ VulnHigh=0; VulnCritical=0; MisHigh=0; MisCritical=0 }
             if (-not (Test-Path $path -PathType Leaf)) { return $out }
-            try { $json = Get-Content $path -Raw | ConvertFrom-Json } catch { return $out }
+
+            try {
+              $json = Get-Content $path -Raw | ConvertFrom-Json
+            } catch {
+              return $out
+            }
+
             if ($null -eq $json.Results) { return $out }
 
             foreach ($r in $json.Results) {
@@ -537,9 +427,9 @@ Notes:
 
           $resultLine = ""
           if (($totalHigh + $totalCritical) -eq 0) {
-            $resultLine = "No HIGH/CRITICAL vulnerabilities or misconfigurations were detected (Trivy)."
+            $resultLine = "OK: No HIGH/CRITICAL vulnerabilities or misconfigurations detected (Trivy)."
           } else {
-            $resultLine = "HIGH/CRITICAL findings detected. Review Trivy attachments for details."
+            $resultLine = "WARN: HIGH/CRITICAL findings detected. Review Trivy attachments."
           }
 
           $summary = @"
@@ -569,71 +459,12 @@ Result:
 
           $outPath = Join-Path $env:REPORT_DIR "vuln-summary.txt"
           $summary | Set-Content -Path $outPath -Encoding UTF8
-
-          # One-line for email header
-          "Trivy HIGH=$totalHigh | CRITICAL=$totalCritical" |
-            Set-Content -Path (Join-Path $env:REPORT_DIR "trivy-summary-line.txt") -Encoding UTF8
-
-          # Extract Top Findings (HIGH/CRITICAL) from available Trivy JSON files
-          function Get-TrivyFindings([string[]]$paths) {
-            $items = @()
-            foreach ($p in $paths) {
-              if (-not (Test-Path $p -PathType Leaf)) { continue }
-              try { $j = Get-Content $p -Raw | ConvertFrom-Json } catch { continue }
-              if (-not $j.Results) { continue }
-
-              foreach ($r in $j.Results) {
-                if ($r.Vulnerabilities) {
-                  foreach ($v in $r.Vulnerabilities) {
-                    if ($v.Severity -in @("HIGH","CRITICAL")) {
-                      $items += [PSCustomObject]@{
-                        Severity = $v.Severity
-                        ID       = $v.VulnerabilityID
-                        Pkg      = $v.PkgName
-                        Installed= $v.InstalledVersion
-                        Fixed    = $v.FixedVersion
-                        Title    = $v.Title
-                        Source   = (Split-Path $p -Leaf)
-                      }
-                    }
-                  }
-                }
-              }
-            }
-            return $items
-          }
-
-          $paths = @(
-            (Join-Path $env:REPORT_DIR "trivy-fs.json"),
-            (Join-Path $env:REPORT_DIR "trivy-api-image.json"),
-            (Join-Path $env:REPORT_DIR "trivy-fe-image.json")
-          )
-
-          $findings = Get-TrivyFindings $paths
-
-          $sevRank = @{ "CRITICAL" = 0; "HIGH" = 1 }
-          $top = $findings |
-            Sort-Object @{Expression={ $sevRank[$_.Severity] }}, @{Expression={$_.ID}} |
-            Select-Object -First 10
-
-          $topPath = Join-Path $env:REPORT_DIR "vuln-top-findings.txt"
-          if (-not $top -or $top.Count -eq 0) {
-            "No HIGH/CRITICAL Trivy findings to list." | Set-Content -Path $topPath -Encoding UTF8
-          } else {
-            "Top Trivy Findings (HIGH/CRITICAL)" | Set-Content -Path $topPath -Encoding UTF8
-            "==================================" | Add-Content $topPath
-            foreach ($t in $top) {
-              Add-Content $topPath ("- ["+$t.Severity+"] "+$t.ID+" | "+$t.Pkg+" | "+$t.Installed+" -> "+$t.Fixed+" | Source: "+$t.Source)
-              if ($t.Title) { Add-Content $topPath ("  Title: "+$t.Title) }
-            }
-          }
-
           Write-Host $summary
         '''
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/vuln-summary.txt, reports/vuln-top-findings.txt, reports/trivy-summary-line.txt'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/vuln-summary.txt'
         }
       }
     }
@@ -731,7 +562,7 @@ API HTTP: $apiCode
           if (-not (Test-Path $env:REPORT_DIR)) { New-Item -ItemType Directory -Force $env:REPORT_DIR | Out-Null }
 
           if (-not (Test-Path "docker-compose.monitoring.yml" -PathType Leaf)) {
-            $msg = "docker-compose.monitoring.yml not found - monitoring deploy skipped (stage completed)."
+            $msg = "docker-compose.monitoring.yml not found - monitoring deploy skipped."
             Write-Host $msg
             $msg | Set-Content -Path (Join-Path $env:REPORT_DIR "monitoring-note.txt") -Encoding UTF8
             exit 0
@@ -783,7 +614,9 @@ receivers:
             try {
               $p = Invoke-WebRequest $env:PROM_READY_URL -UseBasicParsing -TimeoutSec 10
               if ($p.StatusCode -eq 200) { $promOk = $true; break }
-            } catch { Start-Sleep -Seconds 3 }
+            } catch {
+              Start-Sleep -Seconds 3
+            }
           }
 
           $amCode = "N/A"
@@ -819,7 +652,6 @@ Build Summary
 =============
 Job:    $env:JOB_NAME
 Build:  #$env:BUILD_NUMBER
-Branch: $env:GIT_BRANCH
 Commit: $env:GIT_SHA
 URL:    $env:BUILD_URL
 
@@ -841,57 +673,49 @@ Grafana:    $env:GRAFANA_URL
         }
       }
     }
-  }
+  } // نهاية stages
 
-post {
-  always {
-    bat """
-      echo ===== POST: DOCKER PS =====
-      docker ps
+  post {
+    always {
+      bat """
+        echo ===== POST: DOCKER PS =====
+        docker ps
 
-      echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
-      docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
-    """
-    archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
-  }
+        echo ===== POST: API CONTAINER LOG TAIL (if exists) =====
+        docker logs keyshield-api --tail 80 2>NUL || echo "No keyshield-api container logs available"
+      """
+      archiveArtifacts allowEmptyArchive: true, artifacts: 'audit_*.json, reports/**'
+    }
 
-  success {
-    script {
-      // --- helpers ---
-      def readSafe = { p, fb -> fileExists(p) ? readFile(p) : fb }
-      def clip = { s, n ->
-        def x = (s ?: '')
-        return (x.length() > n) ? (x.substring(0, n) + "\n...[clipped]...") : x
-      }
-      def esc = { s ->
-        (s ?: '')
-          .replace("&", "&amp;")
-          .replace("<", "&lt;")
-          .replace(">", "&gt;")
-      }
+    success {
+      script {
+        def readSafe = { p, fb -> fileExists(p) ? readFile(p) : fb }
+        def clip = { s, n ->
+          def x = (s ?: '')
+          return (x.length() > n) ? (x.substring(0, n) + "\n...[clipped]...") : x
+        }
+        def esc = { s ->
+          (s ?: '')
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        }
 
-      // --- existing reports you already generate ---
-      def vulnSummary = readSafe('reports/vuln-summary.txt', 'No vuln-summary.txt generated.')
-      def smoke      = readSafe('reports/smoke-test.txt', 'No smoke-test.txt generated.')
-      def monitorVal = readSafe('reports/alerts-validation.txt', 'No alerts-validation.txt generated.')
-      def buildSum   = readSafe('reports/build-summary.txt', 'No build-summary.txt generated.')
+        def buildSum   = readSafe('reports/build-summary.txt', 'No build-summary.txt generated.')
+        def vulnSummary= readSafe('reports/vuln-summary.txt',  'No vuln-summary.txt generated.')
+        def smoke      = readSafe('reports/smoke-test.txt',    'No smoke-test.txt generated.')
+        def monitorVal = readSafe('reports/alerts-validation.txt','No alerts-validation.txt generated.')
 
-      // --- NEW: code-quality stage outputs (non-blocking summaries) ---
-      def eslintApi  = readSafe('reports/eslint/eslint-api.txt', 'No ESLint API output (file missing).')
-      def eslintFe   = readSafe('reports/eslint/eslint-fe.txt',  'No ESLint Frontend output (file missing).')
-      def prettier   = readSafe('reports/prettier/prettier-check.txt', 'No Prettier output (file missing).')
+        // Code quality outputs
+        def eslintApi  = readSafe('reports/eslint/eslint-api.txt', 'No ESLint API output.')
+        def eslintFe   = readSafe('reports/eslint/eslint-fe.txt',  'No ESLint Frontend output.')
+        def prettier   = readSafe('reports/prettier/prettier-check.txt', 'No Prettier output.')
 
-      // --- NEW: dependency-check stage output ---
-      def dcNote = readSafe('reports/dependency-check/dependency-check-note.txt',
-                            'No dependency-check-note.txt (check reports/dependency-check/).')
+        // Dependency-Check note (and full reports are attached)
+        def dcNote     = readSafe('reports/dependency-check/dependency-check-note.txt',
+                                  'No dependency-check-note.txt (see reports/dependency-check/).')
 
-      emailext(
-        to: "${ALERT_TO}",
-        subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-        mimeType: 'text/html; charset=UTF-8',
-
-        // ✅ UPDATED: include new stage folders (eslint/prettier/dependency-check)
-        attachmentsPattern: [
+        def attachments = [
           'reports/build-summary.txt',
           'reports/vuln-summary.txt',
           'reports/trivy-fs.txt',
@@ -905,14 +729,17 @@ post {
           'reports/eslint/**',
           'reports/prettier/**',
           'reports/dependency-check/**'
-        ].join(','),
+        ].join(',')
 
-        body: """
+        emailext(
+          to: "${ALERT_TO}",
+          subject: "SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+          mimeType: 'text/html; charset=UTF-8',
+          attachmentsPattern: attachments,
+          body: """
 <!doctype html>
 <html>
-<head>
-  <meta charset="UTF-8">
-</head>
+<head><meta charset="UTF-8"></head>
 <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
 
   <h2 style="margin:0 0 10px 0;">
@@ -935,7 +762,7 @@ post {
   <h3 style="margin:14px 0 8px 0;">Build Summary</h3>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(buildSum)}</pre>
 
-  <h3 style="margin:14px 0 8px 0;">Code Quality Summary (ESLint / Prettier)</h3>
+  <h3 style="margin:14px 0 8px 0;">Code Quality (ESLint / Prettier)</h3>
   <p style="margin:0 0 6px 0;"><b>ESLint (API)</b></p>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(eslintApi, 2500))}</pre>
 
@@ -945,10 +772,10 @@ post {
   <p style="margin:0 0 6px 0;"><b>Prettier Check</b></p>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(prettier, 2000))}</pre>
 
-  <h3 style="margin:14px 0 8px 0;">Security Summary (Trivy)</h3>
+  <h3 style="margin:14px 0 8px 0;">Security (Trivy)</h3>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(vulnSummary)}</pre>
 
-  <h3 style="margin:14px 0 8px 0;">SCA Summary (Dependency-Check)</h3>
+  <h3 style="margin:14px 0 8px 0;">SCA (Dependency-Check)</h3>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(dcNote, 1200))}</pre>
 
   <h3 style="margin:14px 0 8px 0;">Release Smoke Test</h3>
@@ -959,7 +786,7 @@ post {
 
   <p style="margin-top:12px;">
     <b>Attachments included:</b>
-    build-summary, vuln-summary, Trivy outputs (txt/json), smoke-test, alerts-validation,
+    build-summary, vuln-summary, Trivy (txt/json), smoke-test, alerts-validation,
     ESLint/Prettier outputs, dependency-check reports, monitoring notes.
   </p>
 
@@ -972,18 +799,18 @@ post {
 </body>
 </html>
 """
-      )
+        )
+      }
     }
-  }
 
-  failure {
-    emailext(
-      to: "${ALERT_TO}",
-      subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
-      mimeType: 'text/html; charset=UTF-8',
-      attachmentsPattern: 'reports/**',
-      attachLog: true,
-      body: """
+    failure {
+      emailext(
+        to: "${ALERT_TO}",
+        subject: "FAILURE: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
+        mimeType: 'text/html; charset=UTF-8',
+        attachmentsPattern: 'reports/**',
+        attachLog: true,
+        body: """
 <!doctype html>
 <html>
 <head><meta charset="UTF-8"></head>
@@ -1000,6 +827,7 @@ post {
 </body>
 </html>
 """
-    )
-  }
-}
+      )
+    }
+  } // نهاية post
+} // نهاية pipeline
