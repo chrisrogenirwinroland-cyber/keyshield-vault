@@ -771,18 +771,12 @@ Grafana:    $env:GRAFANA_URL
   <h3 style="margin:16px 0 8px 0;">Build Summary</h3>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(buildSum)}</pre>
 
-  <h3 style="margin:16px 0 8px 0;">Code Quality (ESLint / Prettier)</h3>
-
-  <p style="margin:0 0 6px 0;"><b>ESLint (API)</b></p>
-  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(eslintApi, 2500))}</pre>
-
-  <p style="margin:0 0 6px 0;"><b>ESLint (Frontend)</b></p>
-  <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(eslintFe, 2500))}</pre>
+  <h3 style="margin:16px 0 8px 0;">Code Quality </h3>
 
   <p style="margin:0 0 6px 0;"><b>Prettier Check</b></p>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(clip(prettier, 2200))}</pre>
 
-  <h3 style="margin:16px 0 8px 0;">Security (Trivy)</h3>
+  <h3 style="margin:16px 0 8px 0;">Security</h3>
   <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(vulnSummary)}</pre>
 
   <h3 style="margin:16px 0 8px 0;">SCA (Dependency-Check)</h3>
