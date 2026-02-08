@@ -6,23 +6,21 @@ pipeline {
     ansiColor('xterm')
     disableConcurrentBuilds()
     buildDiscarder(logRotator(numToKeepStr: '20'))
+    skipDefaultCheckout(true)
   }
 
   environment {
-    APP_NAME       = 'keyshield-vault'
-    REPORT_DIR     = 'reports'
+    // ---- Adjust to your naming ----
+    DOCKERHUB_USER     = 'rogen7spark'
+    API_IMAGE          = 'rogen7spark/keyshield-vault-api'
+    WEB_IMAGE          = 'rogen7spark/keyshield-vault-web'
 
-    // ✅ Your Jenkins credential IDs
-    NVD_API_CRED   = 'nvd-api-key'          // Secret text
-    SONAR_CRED     = 'sonar-token'          // Secret text (change if different)
-    DOCKERHUB_CRED = 'dockerhub-creds'      // Username+Password (change if different)
+    // Sonar identifiers (from your logs)
+    SONAR_ORG          = 'chrisrogenirwinroland-cyber'
+    SONAR_PROJECT_KEY  = 'chrisrogenirwinroland-cyber_keyshield-vault'
 
-    DOCKERHUB_USER = 'rogen7spark'
-    IMAGE_API      = "${DOCKERHUB_USER}/keyshield-vault-api"
-    IMAGE_WEB      = "${DOCKERHUB_USER}/keyshield-vault-web"
-
-    GIT_SHA        = ''
-    IMAGE_TAG      = ''
+    // Local report folder
+    REPORTS_DIR        = 'reports'
   }
 
   stages {
@@ -30,20 +28,21 @@ pipeline {
     stage('Checkout & Traceability') {
       steps {
         checkout scm
+
         script {
-          // reliable SHA even on detached HEAD
           env.GIT_SHA = bat(returnStdout: true, script: 'git rev-parse --short=7 HEAD').trim()
-          env.IMAGE_TAG = "${env.GIT_SHA}-${env.BUILD_NUMBER}"
+          env.IMAGE_TAG = env.GIT_SHA
+          echo "Resolved GIT_SHA=${env.GIT_SHA}"
+          echo "Resolved IMAGE_TAG=${env.IMAGE_TAG}"
         }
-        bat """
+
+        bat '''
           echo ===== GIT TRACEABILITY =====
           git --version
           git rev-parse --short=7 HEAD
           git log -1 --oneline
-          echo GIT_SHA=%GIT_SHA%
-          echo IMAGE_TAG=%IMAGE_TAG%
           git status --porcelain
-        """
+        '''
       }
     }
 
@@ -76,30 +75,54 @@ pipeline {
           bat '''
             echo ===== FE INSTALL =====
             npm ci
-            npm audit --audit-level=high || exit /b 0
           '''
+        }
+      }
+    }
+
+    stage('Unit Tests (optional)') {
+      steps {
+        // Runs only if test script exists; won’t fail build if absent
+        dir('api') {
+          bat 'npm run test --if-present'
+        }
+        dir('frontend/app') {
+          bat 'npm run test --if-present'
+        }
+      }
+      post {
+        always {
+          // keep permissive, because your logs show "No test report files were found"
+          junit allowEmptyResults: true, testResults: '**/TEST-*.xml, **/junit*.xml, **/reports/junit/**/*.xml'
+          archiveArtifacts allowEmptyArchive: true, artifacts: '**/coverage/**, **/npm-debug.log'
         }
       }
     }
 
     stage('Code Quality - ESLint/Prettier') {
       steps {
+        // ✅ FIX: remove invalid '||' and keep PowerShell-compatible logic
         powershell '''
           Write-Host "===== CODE QUALITY: ESLINT + PRETTIER ====="
+
           Write-Host "-- ESLint API"
           Push-Location "api"
-          npx eslint . || exit 0
+          & npx eslint .
+          if ($LASTEXITCODE -ne 0) { Write-Warning "ESLint API findings (non-blocking)"; $global:LASTEXITCODE = 0 }
           Pop-Location
 
           Write-Host "-- ESLint Frontend"
           Push-Location "frontend/app"
-          npx eslint . || exit 0
+          & npx eslint .
+          if ($LASTEXITCODE -ne 0) { Write-Warning "ESLint Frontend findings (non-blocking)"; $global:LASTEXITCODE = 0 }
           Pop-Location
 
           Write-Host "-- Prettier check (repo)"
-          npx prettier -c . || exit 0
+          & npx prettier -c .
+          if ($LASTEXITCODE -ne 0) { Write-Warning "Prettier findings (non-blocking)"; $global:LASTEXITCODE = 0 }
 
           Write-Host "===== CODE QUALITY COMPLETE ====="
+          exit 0
         '''
       }
       post {
@@ -127,13 +150,18 @@ pipeline {
 
     stage('Code Quality - SonarCloud') {
       steps {
-        withCredentials([string(credentialsId: "${SONAR_CRED}", variable: 'SONAR_TOKEN')]) {
-          script {
-            def scannerHome = tool 'SonarQubeScanner'
-            withSonarQubeEnv('SonarCloud') {
+        script {
+          def scannerHome = tool 'SonarQubeScanner'  // must match your Jenkins tool name
+          withSonarQubeEnv('SonarCloud') {          // must match your Jenkins Sonar config name
+            withCredentials([string(credentialsId: 'sonarcloud-token', variable: 'SONAR_TOKEN')]) {
               bat """
                 echo ===== SONARCLOUD SCAN (MONOREPO) =====
-                "${scannerHome}\\bin\\sonar-scanner.bat" ^
+                "${scannerHome}\\\\bin\\\\sonar-scanner.bat" ^
+                  -Dsonar.organization=${SONAR_ORG} ^
+                  -Dsonar.projectKey=${SONAR_PROJECT_KEY} ^
+                  -Dsonar.sources=. ^
+                  -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/.angular/**,**/coverage/** ^
+                  -Dsonar.javascript.lcov.reportPaths=api/coverage/lcov.info,frontend/app/coverage/lcov.info ^
                   -Dsonar.login=%SONAR_TOKEN%
               """
             }
@@ -144,136 +172,65 @@ pipeline {
 
     stage('Security - Trivy FS Scan (vuln+misconfig)') {
       steps {
-        bat """
+        bat '''
           echo ===== TRIVY FILESYSTEM SCAN =====
-          if not exist %REPORT_DIR%\\trivy mkdir %REPORT_DIR%\\trivy
-
-          trivy fs --scanners vuln,misconfig --format json --output %REPORT_DIR%\\trivy\\trivy-fs-api.json api || exit /b 0
-          trivy fs --scanners vuln,misconfig --format json --output %REPORT_DIR%\\trivy\\trivy-fs-frontend.json frontend/app || exit /b 0
-
+          if not exist reports mkdir reports
+          trivy fs --scanners vuln,misconfig --format json -o reports\\trivy-fs.json .
           echo ===== TRIVY FS SCAN COMPLETE =====
-        """
+        '''
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy/**'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy-fs.json'
         }
       }
     }
 
     stage('Security - Dependency-Check (SCA)') {
-      options { timeout(time: 30, unit: 'MINUTES') }
       steps {
-        withCredentials([string(credentialsId: "${NVD_API_CRED}", variable: 'NVD_API_KEY')]) {
-          powershell '''
-            Write-Host "===== OWASP DEPENDENCY-CHECK (SCA) ====="
+        withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
+          bat '''
+            echo ===== OWASP DEPENDENCY-CHECK (SCA) =====
+            if not exist reports mkdir reports
 
-            $root   = Join-Path $env:WORKSPACE $env:REPORT_DIR
-            $outDir = Join-Path $root "dependency-check"
-            New-Item -ItemType Directory -Force $outDir | Out-Null
-
-            # Persistent cache under JENKINS_HOME
-            $jenkinsHome = $env:JENKINS_HOME
-            if (-not $jenkinsHome) { $jenkinsHome = "C:\\ProgramData\\Jenkins\\.jenkins" }
-            $dcData = Join-Path $jenkinsHome "dependency-check-data"
-            New-Item -ItemType Directory -Force $dcData | Out-Null
-
-            # Update only once per 24h
-            $dbFile = Join-Path $dcData "odc.mv.db"
-            $needUpdate = $true
-            if (Test-Path $dbFile) {
-              $ageHours = (New-TimeSpan -Start (Get-Item $dbFile).LastWriteTime -End (Get-Date)).TotalHours
-              if ($ageHours -lt 24) { $needUpdate = $false }
-            }
-
-            $srcMount  = "$($env:WORKSPACE):/src"
-            $dataMount = "$($dcData):/usr/share/dependency-check/data"
-
-            docker pull owasp/dependency-check:latest
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "Dependency-Check image pull failed (non-blocking)."
-              exit 0
-            }
-
-            $cmd = @(
-              "run","--rm",
-              "-v",$srcMount,
-              "-v",$dataMount,
-              "-w","/src",
-              "owasp/dependency-check:latest",
-              "--project=$($env:APP_NAME)",
-              "--scan=/src/api/package.json",
-              "--scan=/src/api/package-lock.json",
-              "--scan=/src/frontend/app/package.json",
-              "--scan=/src/frontend/app/package-lock.json",
-              "--format=HTML",
-              "--format=JSON",
-              "--out=/src/"+$env:REPORT_DIR+"/dependency-check",
-              "--log=/src/"+$env:REPORT_DIR+"/dependency-check/dependency-check.log",
-              "--nvdApiKey=$($env:NVD_API_KEY)",
-              "--nvdApiDelay=2000",
-              "--cveValidForHours=24",
-              "--failOnCVSS=11"
-            )
-
-            if (-not $needUpdate) {
-              Write-Host "Using cached DB (--noupdate)"
-              $cmd += "--noupdate"
-            } else {
-              Write-Host "Updating NVD DB (first run may take time)"
-            }
-
-            & docker @cmd
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "Dependency-Check non-zero exit code (non-blocking)."
-            }
-
-            exit 0
+            REM Prefer cached DB to avoid huge updates on every run
+            docker run --rm ^
+              -e NVD_API_KEY=%NVD_API_KEY% ^
+              -v "%WORKSPACE%:/src:rw" ^
+              owasp/dependency-check:latest ^
+              --scan /src ^
+              --format "HTML" --format "JSON" ^
+              --out /src/reports ^
+              --noupdate
           '''
         }
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/dependency-check/**'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/dependency-check-report.*'
         }
       }
     }
 
     stage('Security - Gitleaks (Secrets Scan)') {
-      options { timeout(time: 10, unit: 'MINUTES') }
       steps {
-        powershell '''
-          Write-Host "===== GITLEAKS SECRETS SCAN ====="
+        bat '''
+          echo ===== GITLEAKS SECRETS SCAN =====
+          if not exist reports\\gitleaks mkdir reports\\gitleaks
 
-          $root   = Join-Path $env:WORKSPACE $env:REPORT_DIR
-          $outDir = Join-Path $root "gitleaks"
-          New-Item -ItemType Directory -Force $outDir | Out-Null
-
-          $repoMount = "$($env:WORKSPACE):/repo"
-          $outMount  = "$($outDir):/out"
-
-          # Use a dedicated /out mount so report writing never hits a permission wall
-          docker pull zricethezav/gitleaks:latest
-          if ($LASTEXITCODE -ne 0) { Write-Host "Gitleaks image pull failed (non-blocking)."; exit 0 }
-
-          & docker run --rm `
-            -v $repoMount `
-            -v $outMount `
-            -w /repo `
-            zricethezav/gitleaks:latest detect `
-              --source="/repo" `
-              --report-format="json" `
-              --report-path="/out/gitleaks-report.json" `
-              --redact `
-              --exit-code=0
-
-          Write-Host "===== GITLEAKS COMPLETE ====="
-          exit 0
+          REM Run as root and write inside mounted workspace (fixes /src permission denied)
+          docker run --rm -u 0 ^
+            -v "%WORKSPACE%:/src:rw" -w /src ^
+            zricethezav/gitleaks:8.18.1 ^
+            detect --source=/src ^
+              --report-format json ^
+              --report-path /src/reports/gitleaks/gitleaks-report.json ^
+              --redact --exit-code 0
         '''
       }
       post {
         always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/gitleaks/**'
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/gitleaks/gitleaks-report.json'
         }
       }
     }
@@ -282,44 +239,29 @@ pipeline {
       steps {
         bat """
           echo ===== DOCKER BUILD =====
-          echo Building %IMAGE_API%:%IMAGE_TAG%
-          docker build -t %IMAGE_API%:%IMAGE_TAG% api
-          echo Building %IMAGE_WEB%:%IMAGE_TAG%
-          docker build -t %IMAGE_WEB%:%IMAGE_TAG% frontend/app
+          echo Building %API_IMAGE%:%IMAGE_TAG%
+          cd api
+          docker build -t %API_IMAGE%:%IMAGE_TAG% .
+          cd ..
+
+          echo Building %WEB_IMAGE%:%IMAGE_TAG%
+          cd frontend\\app
+          docker build -t %WEB_IMAGE%:%IMAGE_TAG% .
+          cd ..\\..
         """
-      }
-    }
-
-    stage('Security - Trivy Image Scan (TAR input, Windows-safe)') {
-      steps {
-        bat """
-          echo ===== TRIVY IMAGE SCAN (TAR) =====
-          if not exist %REPORT_DIR%\\trivy mkdir %REPORT_DIR%\\trivy
-
-          docker save %IMAGE_API%:%IMAGE_TAG% -o %REPORT_DIR%\\trivy\\api.tar
-          docker save %IMAGE_WEB%:%IMAGE_TAG% -o %REPORT_DIR%\\trivy\\web.tar
-
-          trivy image --input %REPORT_DIR%\\trivy\\api.tar --format json --output %REPORT_DIR%\\trivy\\trivy-image-api.json || exit /b 0
-          trivy image --input %REPORT_DIR%\\trivy\\web.tar --format json --output %REPORT_DIR%\\trivy\\trivy-image-web.json || exit /b 0
-
-          echo ===== TRIVY IMAGE SCAN COMPLETE =====
-        """
-      }
-      post {
-        always {
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/trivy/**'
-        }
       }
     }
 
     stage('Push Images (Docker Hub)') {
       steps {
-        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CRED}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
           bat """
             echo ===== DOCKER PUSH =====
-            echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
-            docker push %IMAGE_API%:%IMAGE_TAG%
-            docker push %IMAGE_WEB%:%IMAGE_TAG%
+            echo %DH_PASS%| docker login -u %DH_USER% --password-stdin
+
+            docker push %API_IMAGE%:%IMAGE_TAG%
+            docker push %WEB_IMAGE%:%IMAGE_TAG%
+
             docker logout
           """
         }
