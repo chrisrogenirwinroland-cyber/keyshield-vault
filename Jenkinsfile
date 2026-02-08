@@ -654,9 +654,7 @@ Grafana:    $env:GRAFANA_URL
       }
     }
 
-  } // end stages
-
-  // ===== Pipeline-level post (EMAIL formatting fixed; removed "Attachments included" text section) =====
+  } 
   post {
 
     always {
@@ -718,7 +716,7 @@ Grafana:    $env:GRAFANA_URL
         def dcNote      = clean(readSafe('reports/dependency-check/dependency-check-note.txt',
                                          'Dependency-Check note not generated.'))
 
-        // Keep attachments enabled (only removed the "attachments included" TEXT section from email body)
+        
         def attachments = [
           'reports/build-summary.txt',
           'reports/vuln-summary.txt',
