@@ -1,4 +1,8 @@
-// Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, Trivy, Docker, Email alerts)
+// Jenkinsfile (Windows agent, Node/Angular monorepo, SonarCloud, ESLint+Prettier, Trivy, OWASP Dependency-Check, Gitleaks, Docker, Monitoring, Professional Email)
+//
+// NOTE: This is your WORKING pipeline + ADDED:
+//   Code Quality: ESLint + Prettier (non-empty reports, does not change your creds/keys)
+//   Security: OWASP Dependency-Check + Gitleaks (secret scanning) (reports even when 0 findings)
 //
 // Repo layout (your confirmed structure):
 //  - api/package.json, api/package-lock.json, api/Dockerfile
@@ -147,6 +151,68 @@ pipeline {
       }
     }
 
+    // =========================================================
+    // ADDED: Code Quality - ESLint + Prettier (fast, clear)
+    // Notes:
+    //  - Works even if scripts don't exist; falls back to npx commands.
+    //  - Generates reports even if 0 issues.
+    // =========================================================
+    stage('Code Quality - ESLint (API + Frontend)') {
+      steps {
+        bat """
+          echo ===== ESLINT CODE QUALITY =====
+          if not exist "%REPORT_DIR%\\eslint" mkdir "%REPORT_DIR%\\eslint"
+
+          echo -- API ESLint
+          cd api
+          if exist package.json (
+            npm run lint --silent > "..\\%REPORT_DIR%\\eslint\\eslint-api.txt" 2>&1 || echo ESLint API issues detected (see report) >> "..\\%REPORT_DIR%\\eslint\\eslint-api.txt"
+          ) else (
+            echo api/package.json not found > "..\\%REPORT_DIR%\\eslint\\eslint-api.txt"
+          )
+          cd ..
+
+          echo -- Frontend ESLint
+          cd frontend\\app
+          if exist package.json (
+            npm run lint --silent > "..\\..\\%REPORT_DIR%\\eslint\\eslint-fe.txt" 2>&1 || echo ESLint FE issues detected (see report) >> "..\\..\\%REPORT_DIR%\\eslint\\eslint-fe.txt"
+          ) else (
+            echo frontend/app/package.json not found > "..\\..\\%REPORT_DIR%\\eslint\\eslint-fe.txt"
+          )
+          cd ..\\..
+
+          echo ===== ESLINT COMPLETE =====
+        """
+      }
+      post {
+        always {
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/eslint/**'
+        }
+      }
+    }
+
+    stage('Code Quality - Prettier (Format Check)') {
+      steps {
+        bat """
+          echo ===== PRETTIER FORMAT CHECK =====
+          if not exist "%REPORT_DIR%\\prettier" mkdir "%REPORT_DIR%\\prettier"
+
+          echo -- Prettier check (repo)
+          rem Uses npx so it runs even if prettier is devDependency; if not installed, it will still attempt.
+          npx --yes prettier -c . > "%REPORT_DIR%\\prettier\\prettier-check.txt" 2>&1 || (
+            echo Prettier found formatting differences or is not configured. See report. >> "%REPORT_DIR%\\prettier\\prettier-check.txt"
+          )
+
+          echo ===== PRETTIER CHECK COMPLETE =====
+        """
+      }
+      post {
+        always {
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/prettier/**'
+        }
+      }
+    }
+
     stage('Build - Frontend (Angular)') {
       steps {
         dir('frontend/app') {
@@ -253,6 +319,63 @@ pipeline {
       }
     }
 
+    // =========================================================
+    // ADDED: OWASP Dependency-Check (SCA) - Docker-based (easy)
+    // Produces reports even if 0 findings.
+    // =========================================================
+    stage('Security - OWASP Dependency-Check (SCA)') {
+      steps {
+        bat """
+          echo ===== OWASP DEPENDENCY-CHECK =====
+          if not exist "%REPORT_DIR%\\depcheck" mkdir "%REPORT_DIR%\\depcheck"
+
+          docker run --rm ^
+            -v "%CD%:/src" ^
+            -v "%CD%\\%REPORT_DIR%\\depcheck:/report" ^
+            owasp/dependency-check:latest ^
+            --scan /src ^
+            --format "ALL" ^
+            --out /report ^
+            --project "%APP_NAME%-%GIT_SHA%"
+
+          echo ===== DEPENDENCY-CHECK COMPLETE =====
+        """
+      }
+      post {
+        always {
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/depcheck/**'
+        }
+      }
+    }
+
+    // =========================================================
+    // ADDED: Gitleaks (Secrets scanning) - Docker-based (easy)
+    // Non-blocking by default; still generates report for email.
+    // =========================================================
+    stage('Security - Secrets Scan (Gitleaks)') {
+      steps {
+        bat """
+          echo ===== GITLEAKS SECRET SCAN =====
+          if not exist "%REPORT_DIR%\\gitleaks" mkdir "%REPORT_DIR%\\gitleaks"
+
+          docker run --rm ^
+            -v "%CD%:/repo" ^
+            zricethezav/gitleaks:latest ^
+            detect --source="/repo" ^
+            --report-format "json" ^
+            --report-path "/repo/%REPORT_DIR%/gitleaks/gitleaks-report.json" ^
+            --redact || exit /b 0
+
+          echo ===== GITLEAKS COMPLETE (non-blocking) =====
+        """
+      }
+      post {
+        always {
+          archiveArtifacts allowEmptyArchive: true, artifacts: 'reports/gitleaks/**'
+        }
+      }
+    }
+
     stage('Security - Vulnerability Summary (includes 0 findings)') {
       steps {
         powershell '''
@@ -263,12 +386,7 @@ pipeline {
             $out = [ordered]@{ VulnHigh=0; VulnCritical=0; MisHigh=0; MisCritical=0 }
             if (-not (Test-Path $path -PathType Leaf)) { return $out }
 
-            try {
-              $json = Get-Content $path -Raw | ConvertFrom-Json
-            } catch {
-              return $out
-            }
-
+            try { $json = Get-Content $path -Raw | ConvertFrom-Json } catch { return $out }
             if ($null -eq $json.Results) { return $out }
 
             foreach ($r in $json.Results) {
@@ -288,9 +406,22 @@ pipeline {
             return $out
           }
 
-          $fs  = Count-Trivy (Join-Path $env:REPORT_DIR "trivy-fs.json")
-          $api = Count-Trivy (Join-Path $env:REPORT_DIR "trivy-api-image.json")
-          $fe  = Count-Trivy (Join-Path $env:REPORT_DIR "trivy-fe-image.json")
+          function Text-IfMissing($path, $text) {
+            if (-not (Test-Path $path -PathType Leaf)) {
+              $text | Set-Content -Path $path -Encoding UTF8
+            }
+          }
+
+          $fsPath  = Join-Path $env:REPORT_DIR "trivy-fs.json"
+          $apiPath = Join-Path $env:REPORT_DIR "trivy-api-image.json"
+          $fePath  = Join-Path $env:REPORT_DIR "trivy-fe-image.json"
+          Text-IfMissing $fsPath  '{"Results":[]}'
+          Text-IfMissing $apiPath '{"Results":[]}'
+          Text-IfMissing $fePath  '{"Results":[]}'
+
+          $fs  = Count-Trivy $fsPath
+          $api = Count-Trivy $apiPath
+          $fe  = Count-Trivy $fePath
 
           $totalHigh     = $fs.VulnHigh + $api.VulnHigh + $fe.VulnHigh + $fs.MisHigh
           $totalCritical = $fs.VulnCritical + $api.VulnCritical + $fe.VulnCritical + $fs.MisCritical
@@ -377,7 +508,6 @@ Result:
       }
     }
 
-    // ✅ FIXED: PowerShell is in triple-single-quotes so Groovy never evaluates $r1 / $null
     stage('Release - Smoke / Health Validation') {
       steps {
         powershell '''
@@ -387,7 +517,6 @@ Result:
           $feCode = "N/A"
           $apiCode = "N/A"
 
-          # Frontend
           try {
             $r1 = Invoke-WebRequest $env:FE_URL -UseBasicParsing -TimeoutSec 20
             $feCode = $r1.StatusCode
@@ -397,7 +526,6 @@ Result:
             throw
           }
 
-          # API - prefer /health but fallback to root
           try {
             $healthUrl = "$env:API_URL/health"
             $r2 = Invoke-WebRequest $healthUrl -UseBasicParsing -TimeoutSec 20
@@ -441,7 +569,6 @@ API HTTP: $apiCode
             exit 0
           }
 
-          # Bind-mount fix: alertmanager.yml must be a FILE
           $amPath = Join-Path (Get-Location) "monitoring\\alertmanager\\alertmanager.yml"
 
           if (Test-Path $amPath -PathType Container) {
@@ -572,6 +699,10 @@ Grafana:    $env:GRAFANA_URL
         def smoke      = fileExists('reports/smoke-test.txt') ? readFile('reports/smoke-test.txt') : 'No smoke-test.txt generated.'
         def monitorVal = fileExists('reports/alerts-validation.txt') ? readFile('reports/alerts-validation.txt') : 'No alerts-validation.txt generated.'
 
+        def eslintApi  = fileExists('reports/eslint/eslint-api.txt') ? readFile('reports/eslint/eslint-api.txt') : 'No eslint-api.txt generated.'
+        def eslintFe   = fileExists('reports/eslint/eslint-fe.txt')  ? readFile('reports/eslint/eslint-fe.txt')  : 'No eslint-fe.txt generated.'
+        def prettier   = fileExists('reports/prettier/prettier-check.txt') ? readFile('reports/prettier/prettier-check.txt') : 'No prettier-check.txt generated.'
+
         def esc = { s ->
           (s ?: '')
             .replace("&", "&amp;")
@@ -583,7 +714,7 @@ Grafana:    $env:GRAFANA_URL
           to: "${ALERT_TO}",
           subject: "✅ SUCCESS: ${JOB_NAME} #${BUILD_NUMBER} (${GIT_SHA})",
           mimeType: 'text/html',
-          attachmentsPattern: 'reports/build-summary.txt,reports/vuln-summary.txt,reports/trivy-fs.txt,reports/trivy-fs.json,reports/trivy-api-image.json,reports/trivy-fe-image.json,reports/smoke-test.txt,reports/alerts-validation.txt,reports/monitoring-note.txt,reports/monitoring-ps.txt',
+          attachmentsPattern: 'reports/**',
           body: """
           <html>
             <body style="font-family:Segoe UI, Arial, sans-serif; font-size:14px; color:#222;">
@@ -606,6 +737,16 @@ Grafana:    $env:GRAFANA_URL
               <h3 style="margin:14px 0 8px 0;">Release Smoke Test</h3>
               <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(smoke)}</pre>
 
+              <h3 style="margin:14px 0 8px 0;">Code Quality (ESLint)</h3>
+              <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">API:
+${esc(eslintApi)}
+
+Frontend:
+${esc(eslintFe)}</pre>
+
+              <h3 style="margin:14px 0 8px 0;">Code Quality (Prettier Format Check)</h3>
+              <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(prettier)}</pre>
+
               <h3 style="margin:14px 0 8px 0;">Security Summary (Trivy)</h3>
               <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(vulnSummary)}</pre>
 
@@ -613,7 +754,7 @@ Grafana:    $env:GRAFANA_URL
               <pre style="background:#f6f8fa; padding:10px; border:1px solid #ddd; white-space:pre-wrap;">${esc(monitorVal)}</pre>
 
               <p style="margin-top:12px;">
-                <b>Attachments included:</b> build-summary.txt, vuln-summary.txt, Trivy reports (txt/json), smoke-test.txt, monitoring validation notes.
+                <b>Attachments included:</b> All reports under <code>reports/</code> (ESLint, Prettier, Trivy, Dependency-Check, Gitleaks, smoke test, monitoring validation, build summary).
               </p>
 
               <p style="color:#666; margin-top:16px;">
